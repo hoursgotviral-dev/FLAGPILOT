@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol, TextIO
+from typing import Any, Literal, Protocol, TextIO
 
 from flagpilot.apply import ApprovalDeniedError, ApprovedFlagsmithWriter
 from flagpilot.types import (
@@ -254,6 +254,7 @@ class RolloutController:
         rollback_to_zero: bool = False,
         health_notifier: HealthNotifier | None = None,
         step_approve: bool = False,
+        plain: bool = False,
     ) -> None:
         if interval_seconds < 0:
             raise ValueError("interval_seconds must be >= 0.")
@@ -266,6 +267,7 @@ class RolloutController:
         self._rollback_to_zero = rollback_to_zero
         self._health_notifier = health_notifier
         self._step_approve = step_approve
+        self._plain = plain
 
     def _log_decision(
         self,
@@ -299,6 +301,154 @@ class RolloutController:
             retained_from_previous_stage=retained_from_previous_stage,
             verified=verified,
         )
+
+    def _is_tty_stream(self) -> bool:
+        return bool(getattr(self._output_stream, "isatty", lambda: False)())
+
+    def _rich_available(self) -> bool:
+        if self._plain:
+            return False
+        try:
+            import rich  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def _build_rollout_table(
+        self,
+        plan: Plan,
+        outcomes: list[StageOutcome],
+        *,
+        is_synthetic: bool,
+    ) -> Any:
+        from rich.table import Table
+
+        caption = (
+            f"SYNTHETIC DATA — {plan.feature_name} ({plan.environment})"
+            if is_synthetic
+            else f"{plan.feature_name} ({plan.environment})"
+        )
+        table = Table(
+            title=f"FlagPilot Live Rollout: {plan.feature_name} ({plan.environment})",
+            caption=caption,
+            header_style="bold cyan",
+        )
+        table.add_column("Stage %", justify="right", style="bold")
+        table.add_column("Exposed Identities", justify="right")
+        table.add_column("Retention Proof")
+        table.add_column("Error Rate vs. Threshold", justify="right")
+        table.add_column("Status", justify="center")
+
+        for outcome in outcomes:
+            m = outcome.metrics
+            d = outcome.decision
+            ret = outcome.retained_from_previous_stage
+            if ret is None:
+                retention_cell = "[dim]— (baseline)[/dim]"
+            else:
+                pct = ret.retention_percentage
+                pct_str = f"{int(pct)}%" if pct.is_integer() else f"{pct:.1f}%"
+                ret_style = "green" if ret.monotonic else "red"
+                ret_word = "monotonic" if ret.monotonic else "NON-MONOTONIC"
+                retention_cell = (
+                    f"[{ret_style}]{ret.retained_count}/{ret.previous_exposed_count} "
+                    f"({pct_str} {ret_word})[/{ret_style}]"
+                )
+
+            threshold = outcome.step.max_error_rate
+            cmp_op = ">" if m.error_rate > threshold else "<="
+            rate_style = "bold red" if d.action == "rollback" else "green"
+            rate_cell = f"[{rate_style}]{m.error_rate:.2%} {cmp_op} {threshold:.2%}[/{rate_style}]"
+
+            if d.action == "rollback":
+                badge = "[bold white on red] ROLLBACK [/bold white on red]"
+            elif d.action in ("hold", "pause"):
+                badge = "[bold black on yellow] HOLD [/bold black on yellow]"
+            elif d.action == "complete":
+                badge = "[bold white on green] COMPLETE [/bold white on green]"
+            else:
+                badge = "[bold white on green] PASS [/bold white on green]"
+
+            table.add_row(
+                f"{outcome.step.percentage}%",
+                f"{m.enabled_count}/{m.sample_count}",
+                retention_cell,
+                rate_cell,
+                badge,
+            )
+        return table
+
+    def _render_rollout_table(
+        self,
+        plan: Plan,
+        outcomes: list[StageOutcome],
+        *,
+        is_synthetic: bool,
+    ) -> None:
+        if not outcomes or not self._rich_available():
+            return
+        from rich.console import Console
+
+        is_tty = self._is_tty_stream()
+        console = Console(
+            file=self._output_stream,
+            no_color=not is_tty,
+            safe_box=True,
+            highlight=False,
+            width=None if is_tty else 140,
+        )
+        console.print(self._build_rollout_table(plan, outcomes, is_synthetic=is_synthetic))
+
+    def _render_rollback_panel(
+        self,
+        *,
+        from_percentage: int,
+        rollback_target: int,
+        reason: str,
+        verification: PostRollbackVerification | None,
+    ) -> None:
+        if not self._rich_available():
+            if verification is not None:
+                badge = "VERIFIED 0/200 EXPOSED" if verification.verified else "EXPOSURE REMAINS"
+                self._output_stream.write(f"{badge}: {verification.summary}\n")
+            return
+
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.text import Text
+
+        is_tty = self._is_tty_stream()
+        encoding = (getattr(self._output_stream, "encoding", None) or "utf-8").lower()
+        arrow = "→" if "utf" in encoding else "->"
+        check = "✔" if "utf" in encoding else "OK"
+        console = Console(
+            file=self._output_stream,
+            no_color=not is_tty,
+            safe_box=True,
+            highlight=False,
+            width=None if is_tty else 140,
+        )
+        panel = Panel(
+            Text(
+                f"Rollback triggered at {from_percentage}% -> {rollback_target}%: {reason}",
+                style="bold",
+            ),
+            title=f"ROLLBACK EXECUTED {arrow} {rollback_target}%",
+            border_style="bold red",
+            padding=(0, 2),
+        )
+        console.print(panel)
+        if verification is not None:
+            if verification.verified:
+                console.print(
+                    f"[bold green]{check} VERIFIED {verification.exposed_count}/{verification.sample_count} EXPOSED[/bold green] "
+                    f"— {verification.summary}"
+                )
+            else:
+                console.print(
+                    f"[bold red]ROLLBACK CHECK FAILED: {verification.exposed_count}/{verification.sample_count} EXPOSED[/bold red] "
+                    f"— {verification.summary}"
+                )
 
     def _verify_post_rollback(
         self,
@@ -367,125 +517,119 @@ class RolloutController:
                     is_synthetic=is_synthetic,
                 )
 
-        for index, step in enumerate(steps):
-            try:
-                self._writer.apply_stage(
-                    plan,
-                    step.percentage,
-                    use_run_approval=not self._step_approve,
-                )
-            except ApprovalDeniedError as exc:
-                status = "aborted" if not outcomes else "paused"
-                self._log_decision(
-                    plan,
-                    action=status,
-                    old_percentage=current_percentage,
-                    new_percentage=current_percentage,
-                    reason=str(exc),
-                )
-                self._output_stream.write(f"Rollout {status}: {exc}\n")
-                return RolloutRunResult(
-                    plan=plan,
-                    final_status=status,
-                    outcomes=tuple(outcomes),
-                    rollback_applied=False,
-                    is_synthetic=is_synthetic,
-                )
+        use_live_table = self._rich_available() and self._is_tty_stream() and not self._step_approve
+        live_ctx: Any = None
+        if use_live_table:
+            from rich.console import Console
+            from rich.live import Live
 
-            current_percentage = step.percentage
-            if self._interval_seconds > 0:
-                self._sleep_fn(self._interval_seconds)
+            live_console = Console(file=self._output_stream, safe_box=True, highlight=False)
+            live_ctx = Live(
+                self._build_rollout_table(plan, outcomes, is_synthetic=is_synthetic),
+                console=live_console,
+                refresh_per_second=8,
+            )
+            live_ctx.start()
 
-            metrics = self._signal_provider.collect(plan, step)
-            monotonic_check = _compute_monotonicity_check(
-                prev_stage_pct,
-                prev_exposed_ids,
-                step.percentage,
-                metrics.exposed_identities,
-            )
-            if monotonic_check is not None:
-                self._output_stream.write(
-                    f"Monotonicity check: {monotonic_check.summary}\n"
-                )
-            prev_stage_pct = step.percentage
-            if metrics.exposed_identities is not None:
-                prev_exposed_ids = frozenset(metrics.exposed_identities)
-
-            next_step = steps[index + 1] if index + 1 < len(steps) else None
-            rollback_target = (
-                plan.rollback_percentage if self._rollback_to_zero else previous_safe_percentage
-            )
-            decision = evaluate_stage(
-                step=step,
-                sample_count=metrics.sample_count,
-                error_count=metrics.error_count,
-                next_step=next_step,
-                observed_error_rate=metrics.error_rate,
-                rollback_target=rollback_target,
-            )
-            outcomes.append(
-                StageOutcome(
-                    step=step,
-                    metrics=metrics,
-                    decision=decision,
-                    applied=True,
-                    retained_from_previous_stage=monotonic_check,
-                )
-            )
-            self._log_decision(
-                plan,
-                action=decision.action,
-                old_percentage=step.percentage,
-                new_percentage=(
-                    decision.next_percentage
-                    if decision.next_percentage is not None
-                    else step.percentage
-                ),
-                reason=decision.reason,
-                observed_error_rate=decision.observed_error_rate,
-                exposed_count=metrics.enabled_count,
-                sample_count=metrics.sample_count,
-                retained_from_previous_stage=(
-                    monotonicity_check_to_dict(monotonic_check)
-                    if monotonic_check is not None
-                    else None
-                ),
-            )
-
-            if decision.action in ("hold", "pause"):
-                self._output_stream.write(
-                    f"Paused at {step.percentage}%: {decision.reason}\n"
-                )
-                return RolloutRunResult(
-                    plan=plan,
-                    final_status="paused",
-                    outcomes=tuple(outcomes),
-                    rollback_applied=False,
-                    is_synthetic=is_synthetic,
-                )
-
-            if decision.action == "rollback":
-                self._output_stream.write(
-                    f"Rollback triggered at {step.percentage}% -> {rollback_target}%: "
-                    f"{decision.reason}\n"
-                )
+        try:
+            for index, step in enumerate(steps):
                 try:
-                    self._writer.rollback(
+                    self._writer.apply_stage(
                         plan,
-                        target_percentage=rollback_target,
-                        reason=decision.reason,
+                        step.percentage,
                         use_run_approval=not self._step_approve,
                     )
                 except ApprovalDeniedError as exc:
+                    status = "aborted" if not outcomes else "paused"
                     self._log_decision(
                         plan,
-                        action="rollback_aborted",
-                        old_percentage=step.percentage,
-                        new_percentage=step.percentage,
+                        action=status,
+                        old_percentage=current_percentage,
+                        new_percentage=current_percentage,
                         reason=str(exc),
-                        observed_error_rate=decision.observed_error_rate,
                     )
-                    self._output_stream.write(f"Rollback not approved: {exc}\n")
+                    self._output_stream.write(f"Rollout {status}: {exc}\n")
+                    return RolloutRunResult(
+                        plan=plan,
+                        final_status=status,
+                        outcomes=tuple(outcomes),
+                        rollback_applied=False,
+                        is_synthetic=is_synthetic,
+                    )
+
+                current_percentage = step.percentage
+                if self._interval_seconds > 0:
+                    self._sleep_fn(self._interval_seconds)
+
+                metrics = self._signal_provider.collect(plan, step)
+                monotonic_check = _compute_monotonicity_check(
+                    prev_stage_pct,
+                    prev_exposed_ids,
+                    step.percentage,
+                    metrics.exposed_identities,
+                )
+                if monotonic_check is not None and not use_live_table:
+                    self._output_stream.write(
+                        f"Monotonicity check: {monotonic_check.summary}\n"
+                    )
+                prev_stage_pct = step.percentage
+                if metrics.exposed_identities is not None:
+                    prev_exposed_ids = frozenset(metrics.exposed_identities)
+
+                next_step = steps[index + 1] if index + 1 < len(steps) else None
+                rollback_target = (
+                    plan.rollback_percentage if self._rollback_to_zero else previous_safe_percentage
+                )
+                decision = evaluate_stage(
+                    step=step,
+                    sample_count=metrics.sample_count,
+                    error_count=metrics.error_count,
+                    next_step=next_step,
+                    observed_error_rate=metrics.error_rate,
+                    rollback_target=rollback_target,
+                )
+                outcomes.append(
+                    StageOutcome(
+                        step=step,
+                        metrics=metrics,
+                        decision=decision,
+                        applied=True,
+                        retained_from_previous_stage=monotonic_check,
+                    )
+                )
+                if live_ctx is not None:
+                    live_ctx.update(
+                        self._build_rollout_table(plan, outcomes, is_synthetic=is_synthetic)
+                    )
+                self._log_decision(
+                    plan,
+                    action=decision.action,
+                    old_percentage=step.percentage,
+                    new_percentage=(
+                        decision.next_percentage
+                        if decision.next_percentage is not None
+                        else step.percentage
+                    ),
+                    reason=decision.reason,
+                    observed_error_rate=decision.observed_error_rate,
+                    exposed_count=metrics.enabled_count,
+                    sample_count=metrics.sample_count,
+                    retained_from_previous_stage=(
+                        monotonicity_check_to_dict(monotonic_check)
+                        if monotonic_check is not None
+                        else None
+                    ),
+                )
+
+                if decision.action in ("hold", "pause"):
+                    if live_ctx is not None:
+                        live_ctx.stop()
+                        live_ctx = None
+                    else:
+                        self._render_rollout_table(plan, outcomes, is_synthetic=is_synthetic)
+                    self._output_stream.write(
+                        f"Paused at {step.percentage}%: {decision.reason}\n"
+                    )
                     return RolloutRunResult(
                         plan=plan,
                         final_status="paused",
@@ -493,30 +637,77 @@ class RolloutController:
                         rollback_applied=False,
                         is_synthetic=is_synthetic,
                     )
-                verification = self._verify_post_rollback(plan, rollback_target)
-                health_status, webhook_sent = _notify_and_record_health(
-                    self._health_notifier,
-                    plan,
-                    status="firing",
-                    summary=f"FlagPilot rollback triggered at {step.percentage}% -> {rollback_target}%",
-                    description=decision.reason,
-                    audit_log_path=self._audit_log_path,
-                    old_percentage=step.percentage,
-                    new_percentage=rollback_target,
-                )
-                return RolloutRunResult(
-                    plan=plan,
-                    final_status="rolled_back",
-                    outcomes=tuple(outcomes),
-                    rollback_applied=True,
-                    rollback_to_percentage=rollback_target,
-                    is_synthetic=is_synthetic,
-                    health_status=health_status,
-                    health_webhook_sent=webhook_sent,
-                    post_rollback_verification=verification,
-                )
 
-            previous_safe_percentage = step.percentage
+                if decision.action == "rollback":
+                    if live_ctx is not None:
+                        live_ctx.stop()
+                        live_ctx = None
+                    else:
+                        self._render_rollout_table(plan, outcomes, is_synthetic=is_synthetic)
+                    self._output_stream.write(
+                        f"Rollback triggered at {step.percentage}% -> {rollback_target}%: "
+                        f"{decision.reason}\n"
+                    )
+                    try:
+                        self._writer.rollback(
+                            plan,
+                            target_percentage=rollback_target,
+                            reason=decision.reason,
+                            use_run_approval=not self._step_approve,
+                        )
+                    except ApprovalDeniedError as exc:
+                        self._log_decision(
+                            plan,
+                            action="rollback_aborted",
+                            old_percentage=step.percentage,
+                            new_percentage=step.percentage,
+                            reason=str(exc),
+                            observed_error_rate=decision.observed_error_rate,
+                        )
+                        self._output_stream.write(f"Rollback not approved: {exc}\n")
+                        return RolloutRunResult(
+                            plan=plan,
+                            final_status="paused",
+                            outcomes=tuple(outcomes),
+                            rollback_applied=False,
+                            is_synthetic=is_synthetic,
+                        )
+                    verification = self._verify_post_rollback(plan, rollback_target)
+                    self._render_rollback_panel(
+                        from_percentage=step.percentage,
+                        rollback_target=rollback_target,
+                        reason=decision.reason,
+                        verification=verification,
+                    )
+                    health_status, webhook_sent = _notify_and_record_health(
+                        self._health_notifier,
+                        plan,
+                        status="firing",
+                        summary=f"FlagPilot rollback triggered at {step.percentage}% -> {rollback_target}%",
+                        description=decision.reason,
+                        audit_log_path=self._audit_log_path,
+                        old_percentage=step.percentage,
+                        new_percentage=rollback_target,
+                    )
+                    return RolloutRunResult(
+                        plan=plan,
+                        final_status="rolled_back",
+                        outcomes=tuple(outcomes),
+                        rollback_applied=True,
+                        rollback_to_percentage=rollback_target,
+                        is_synthetic=is_synthetic,
+                        health_status=health_status,
+                        health_webhook_sent=webhook_sent,
+                        post_rollback_verification=verification,
+                    )
+
+                previous_safe_percentage = step.percentage
+        finally:
+            if live_ctx is not None:
+                live_ctx.stop()
+
+        if not use_live_table:
+            self._render_rollout_table(plan, outcomes, is_synthetic=is_synthetic)
 
         health_status, webhook_sent = _notify_and_record_health(
             self._health_notifier,

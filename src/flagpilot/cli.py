@@ -30,6 +30,7 @@ from flagpilot.planner import (
     build_plan,
     load_plan,
     parse_plain_english_request,
+    render_plan_summary,
     save_plan_artifacts,
 )
 from flagpilot.report import (
@@ -56,15 +57,23 @@ DEFAULT_MAX_ERROR_RATE = 0.02
 class _SyntheticSignalProvider:
     """Adapter connecting persistent-identity TrafficSimulator to RolloutController."""
 
-    def __init__(self, evaluator: FlagEvaluator, simulator: TrafficSimulator) -> None:
+    def __init__(
+        self,
+        evaluator: FlagEvaluator,
+        simulator: TrafficSimulator,
+        *,
+        verbose: bool = True,
+    ) -> None:
         self._evaluator = evaluator
         self._simulator = simulator
+        self._verbose = verbose
 
     def collect(self, plan: Plan, step: Step) -> StageMetrics:
         if isinstance(self._evaluator, OfflineFakeEvaluator):
             self._evaluator.set_percentage(step.percentage)
         round_result = self._simulator.run_round(plan.feature_name)
-        print(round_result.format_summary())
+        if self._verbose:
+            print(round_result.format_summary())
         return round_result.to_stage_metrics(step.percentage)
 
     def verify_rollback(self, plan: Plan, target_percentage: int) -> StageMetrics:
@@ -125,6 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="flagpilot",
         description="Staged feature flag rollout controller for self-hosted Flagsmith.",
     )
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Disable Rich panels/tables and emit plain deterministic text",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     bootstrap_parser = subparsers.add_parser(
@@ -161,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--out-dir", type=Path, default=Path("."))
     plan_parser.add_argument("--out", type=Path, default=None, help="Output plan JSON path")
     plan_parser.add_argument("--md-out", type=Path, default=None, help="Output plan Markdown path")
+    plan_parser.add_argument(
+        "--plain",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Render plain text summary instead of a Rich panel",
+    )
 
     apply_parser = subparsers.add_parser("apply", help="Apply a plan (requires APPROVE)")
     apply_parser.add_argument("plan_file", nargs="?", type=Path, default=None, help="Path to plan.json")
@@ -212,6 +232,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--step-approve",
         action="store_true",
         help="Require APPROVE before each stage and rollback instead of upfront schedule approval",
+    )
+    run_parser.add_argument(
+        "--plain",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Render plain text progress instead of Rich tables and panels",
     )
     run_parser.add_argument("--audit-log", type=Path, default=Path("audit.log"))
 
@@ -288,6 +314,7 @@ def _handle_plan(args: argparse.Namespace) -> int:
     json_path = args.out if args.out is not None else args.out_dir / "plan.json"
     md_path = args.md_out if args.md_out is not None else json_path.with_suffix(".md")
     save_plan_artifacts(plan, json_path=json_path, markdown_path=md_path)
+    render_plan_summary(plan, plain=bool(getattr(args, "plain", False)))
     print(f"Wrote {json_path} and {md_path} (no Flagsmith API calls made).")
     return 0
 
@@ -326,7 +353,13 @@ def _handle_run(args: argparse.Namespace) -> int:
         baseline_rate=args.baseline_error_rate,
         error_rate_fn=error_rate_fn,
     )
-    provider = _SyntheticSignalProvider(evaluator, simulator)
+    plain_mode = bool(getattr(args, "plain", False))
+    tty_stdout = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    provider = _SyntheticSignalProvider(
+        evaluator,
+        simulator,
+        verbose=plain_mode or not tty_stdout,
+    )
     controller = RolloutController(
         writer=writer,
         signal_provider=provider,
@@ -335,6 +368,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         rollback_to_zero=args.rollback_to_zero,
         health_notifier=backend if isinstance(backend, HealthNotifier) else None,
         step_approve=args.step_approve,
+        plain=plain_mode,
     )
     try:
         result = controller.run(plan, is_synthetic=True)

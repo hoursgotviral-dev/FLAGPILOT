@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from flagpilot.types import BreachAction, Plan, Step
 
@@ -476,3 +477,90 @@ def load_plan(path: Path) -> Plan:
     """Load and validate a Plan from a JSON file."""
     raw = json.loads(path.read_text(encoding="utf-8"))
     return plan_from_dict(raw)
+
+
+def _supports_unicode(stream: TextIO) -> bool:
+    encoding = (getattr(stream, "encoding", None) or "utf-8").lower()
+    return "utf" in encoding
+
+
+def format_plan_summary_plain(plan: Plan) -> str:
+    """Format a deterministic plain-text summary of a rollout plan."""
+    progression = "0% -> " + " -> ".join(f"{step.percentage}%" for step in plan.steps)
+    threshold = plan.steps[0].max_error_rate
+    min_samples = plan.steps[0].min_samples
+    segment = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
+    calls = planned_api_calls(plan)
+    lines = [
+        f"FlagPilot Rollout Plan: {plan.feature_name}",
+        f"Environment: {plan.environment}",
+        f"Segment: {segment} (PERCENTAGE_SPLIT)",
+        f"Stage Progression: {progression}",
+        f"Safety Threshold: max_error_rate <= {threshold:.2%} (min_samples={min_samples}, on_breach={plan.on_breach} -> {plan.rollback_percentage}%)",
+        "Planned Flagsmith API Calls:",
+    ]
+    for idx, call in enumerate(calls, start=1):
+        lines.append(f"  {idx}. {call}")
+    return "\n".join(lines) + "\n"
+
+
+def render_plan_summary(
+    plan: Plan,
+    *,
+    plain: bool = False,
+    output_stream: TextIO | None = None,
+) -> None:
+    """Render a bordered Rich summary panel for ``flagpilot plan`` (or plain fallback)."""
+    out = output_stream if output_stream is not None else sys.stdout
+    if plain:
+        out.write(format_plan_summary_plain(plan))
+        out.flush()
+        return
+
+    try:
+        from rich.console import Console, Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+    except ImportError:
+        out.write(format_plan_summary_plain(plan))
+        out.flush()
+        return
+
+    arrow = "→" if _supports_unicode(out) else "->"
+    progression = f"0% {arrow} " + f" {arrow} ".join(f"{step.percentage}%" for step in plan.steps)
+    threshold = plan.steps[0].max_error_rate
+    min_samples = plan.steps[0].min_samples
+    segment = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
+    is_tty = bool(getattr(out, "isatty", lambda: False)())
+
+    meta_table = Table.grid(padding=(0, 2))
+    meta_table.add_column(style="bold cyan", no_wrap=True)
+    meta_table.add_column()
+    meta_table.add_row("Target Flag", plan.feature_name)
+    meta_table.add_row("Environment", plan.environment)
+    meta_table.add_row("Segment", f"{segment} (PERCENTAGE_SPLIT)")
+    meta_table.add_row("Stage Progression", progression)
+    meta_table.add_row(
+        "Safety Threshold",
+        f"error_rate <= {threshold:.2%} (min_samples={min_samples}, on_breach={plan.on_breach} {arrow} {plan.rollback_percentage}%)",
+    )
+
+    calls = planned_api_calls(plan)
+    calls_header = Text("Planned Flagsmith API Calls (dry plan — zero calls sent):", style="bold")
+    calls_lines = [Text(f"  {idx}. {call}", style="dim") for idx, call in enumerate(calls, start=1)]
+
+    panel = Panel(
+        Group(meta_table, Text(""), calls_header, *calls_lines),
+        title="FlagPilot Rollout Plan",
+        border_style="cyan",
+        padding=(1, 2),
+    )
+    console = Console(
+        file=out,
+        no_color=not is_tty,
+        safe_box=True,
+        highlight=False,
+        width=None if is_tty else 120,
+    )
+    console.print(panel)
