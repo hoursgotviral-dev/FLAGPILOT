@@ -28,8 +28,10 @@ from flagpilot.planner import (
     DEFAULT_STAGES,
     PlanValidationError,
     build_plan,
+    is_llm_configured,
     load_plan,
     parse_plain_english_request,
+    plan_with_llm,
     render_plan_summary,
     save_plan_artifacts,
 )
@@ -181,6 +183,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="Render plain text summary instead of a Rich panel",
     )
+    plan_parser.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="Opt into the optional LLM planner adapter (falls back to deterministic parser on error)",
+    )
 
     apply_parser = subparsers.add_parser("apply", help="Apply a plan (requires APPROVE)")
     apply_parser.add_argument("plan_file", nargs="?", type=Path, default=None, help="Path to plan.json")
@@ -290,12 +297,20 @@ def _handle_bootstrap(args: argparse.Namespace) -> int:
 
 def _handle_plan(args: argparse.Namespace) -> int:
     if args.request is not None:
-        plan = parse_plain_english_request(
-            args.request,
-            min_samples=args.min_samples,
-            project_id=args.project_id,
-            segment_name=args.segment_name,
-        )
+        if args.use_llm or is_llm_configured():
+            plan = plan_with_llm(
+                args.request,
+                min_samples=args.min_samples,
+                project_id=args.project_id,
+                segment_name=args.segment_name,
+            )
+        else:
+            plan = parse_plain_english_request(
+                args.request,
+                min_samples=args.min_samples,
+                project_id=args.project_id,
+                segment_name=args.segment_name,
+            )
     elif args.feature and args.env:
         plan = build_plan(
             feature_name=args.feature,

@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import sys
-from collections.abc import Sequence
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
 from flagpilot.types import BreachAction, Plan, Step
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_STAGES: tuple[int, ...] = (1, 10, 50, 100)
 
@@ -177,6 +183,180 @@ def parse_plain_english_request(
         description=f"Parsed from request: {text}",
         source_request=text,
     )
+
+
+def _strip_json_fences(raw_text: str) -> str:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def is_llm_configured() -> bool:
+    """Return True only when FLAGPILOT_LLM_PROVIDER and its matching API key are set."""
+    provider = os.environ.get("FLAGPILOT_LLM_PROVIDER", "").strip().lower()
+    if provider == "gemini":
+        return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    if provider == "openai":
+        return bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    return False
+
+
+def plan_with_llm(
+    prompt: str,
+    *,
+    min_samples: int = 20,
+    project_id: int | None = None,
+    segment_name: str | None = None,
+    provider: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    timeout_seconds: float = 15.0,
+    opener: Callable[..., Any] | None = None,
+) -> Plan:
+    """Optional thin LLM planner adapter targeting ``plan_from_dict`` with deterministic fallback.
+
+    Off by default; uses standard-library HTTP (Gemini or OpenAI REST APIs) to request
+    strict JSON conforming to ``Plan``, validates through ``plan_from_dict()``, and falls
+    back gracefully to ``parse_plain_english_request()`` on missing keys, network errors,
+    or invalid/malformed LLM JSON.
+    """
+    clean_prompt = prompt.strip()
+    resolved_provider = (provider or os.environ.get("FLAGPILOT_LLM_PROVIDER", "")).strip().lower()
+    if not resolved_provider:
+        if os.environ.get("GEMINI_API_KEY", "").strip():
+            resolved_provider = "gemini"
+        elif os.environ.get("OPENAI_API_KEY", "").strip():
+            resolved_provider = "openai"
+
+    if resolved_provider == "gemini":
+        resolved_key = (api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+    elif resolved_provider == "openai":
+        resolved_key = (api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
+    else:
+        resolved_key = ""
+
+    def _fallback(reason: str) -> Plan:
+        cleaned_reason = reason.replace(resolved_key, "[REDACTED]") if resolved_key else reason
+        logger.warning(
+            "LLM planner fallback (%s); using deterministic parser.",
+            cleaned_reason,
+        )
+        return parse_plain_english_request(
+            prompt,
+            min_samples=min_samples,
+            project_id=project_id,
+            segment_name=segment_name,
+        )
+
+    if not clean_prompt:
+        return _fallback("empty prompt")
+    if resolved_provider not in ("gemini", "openai") or not resolved_key:
+        return _fallback("no supported FLAGPILOT_LLM_PROVIDER and API key configured")
+
+    system_instruction = (
+        "Return ONLY a single JSON object (no prose or markdown) matching this exact Plan schema:\n"
+        "{\n"
+        '  "feature_name": "string",\n'
+        '  "environment": "string",\n'
+        '  "steps": [{"percentage": 1, "min_samples": 20, "max_error_rate": 0.02}],\n'
+        '  "rollback_percentage": 0,\n'
+        '  "on_breach": "rollback" | "pause",\n'
+        '  "segment_name": "optional string",\n'
+        '  "project_id": null\n'
+        "}\n"
+        "Percentages in steps must be integers in 1..100 and strictly increasing. "
+        "max_error_rate is a decimal fraction in 0.0..1.0 (e.g. 2% -> 0.02)."
+    )
+
+    if resolved_provider == "gemini":
+        resolved_model = (
+            model or os.environ.get("FLAGPILOT_LLM_MODEL", "gemini-2.5-flash")
+        ).strip()
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{resolved_model}:generateContent"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": resolved_key,
+        }
+        body: dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "contents": [{"role": "user", "parts": [{"text": clean_prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "responseMimeType": "application/json",
+            },
+        }
+    else:
+        resolved_model = (model or os.environ.get("FLAGPILOT_LLM_MODEL", "gpt-4o-mini")).strip()
+        base = os.environ.get("FLAGPILOT_OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        url = f"{base}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {resolved_key}",
+        }
+        body = {
+            "model": resolved_model,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": clean_prompt},
+            ],
+        }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    open_fn = opener if opener is not None else urllib.request.urlopen
+
+    try:
+        with open_fn(req, timeout=timeout_seconds) as resp:
+            raw_http = resp.read()
+        envelope = json.loads(
+            raw_http.decode("utf-8") if isinstance(raw_http, bytes) else str(raw_http)
+        )
+        if resolved_provider == "gemini":
+            content_text = envelope["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            content_text = envelope["choices"][0]["message"]["content"]
+        parsed_payload = json.loads(_strip_json_fences(str(content_text)))
+        if not isinstance(parsed_payload, dict):
+            raise PlanValidationError("LLM response must decode to a JSON object.")
+
+        if project_id is not None:
+            parsed_payload["project_id"] = project_id
+        if segment_name:
+            parsed_payload["segment_name"] = segment_name
+        parsed_payload.setdefault("source_request", clean_prompt)
+        if isinstance(parsed_payload.get("steps"), list):
+            for step_item in parsed_payload["steps"]:
+                if isinstance(step_item, dict):
+                    step_item.setdefault("min_samples", min_samples)
+
+        return plan_from_dict(parsed_payload)
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        OSError,
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return _fallback(f"{type(exc).__name__}: {exc}")
 
 
 def build_plan(
