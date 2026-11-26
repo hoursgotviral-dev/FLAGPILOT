@@ -83,6 +83,7 @@ class SimulationRoundResult:
             enabled_count=self.exposed_count,
             source_label=self.label,
             reported_error_rate=monitored_rate,
+            exposed_identities=self.exposed_identities,
         )
 
     def format_summary(self) -> str:

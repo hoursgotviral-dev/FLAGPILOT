@@ -60,7 +60,7 @@ switch ($Task) {
         & $FlagPilot apply plan.json
     }
     "demo-run" {
-        Write-Host "=== [3/5] RUN WITH SEEDED ERROR SPIKE AT 50% (HUMAN ACTION: type APPROVE at each step & rollback) ==="
+        Write-Host "=== [3/5] RUN WITH SEEDED ERROR SPIKE AT 50% (HUMAN ACTION: type APPROVE once upfront for schedule & auto-rollback to 0%) ==="
         & $FlagPilot run `
             --feature checkout_v2 `
             --env Development `
@@ -70,14 +70,15 @@ switch ($Task) {
             --spike-rate 0.25 `
             --spike-threshold-pct 25 `
             --seed 42 `
-            --interval 0
+            --interval 0 `
+            --rollback-to-zero
     }
     "demo-rollback" {
-        Write-Host "=== [4/5] ROLLBACK TO 0% (HUMAN ACTION: type APPROVE when prompted) ==="
+        Write-Host "=== [4/5] CONFIRM CLEAN 0% RESET & HEALTHY STATUS (HUMAN ACTION: type APPROVE when prompted) ==="
         & $FlagPilot rollback `
             --feature checkout_v2 `
             --env Development `
-            --old-percentage 10 `
+            --old-percentage 0 `
             --reason "demo cleanup"
     }
     "demo-report" {

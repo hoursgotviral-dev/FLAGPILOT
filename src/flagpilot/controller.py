@@ -15,7 +15,9 @@ from flagpilot.apply import ApprovalDeniedError, ApprovedFlagsmithWriter
 from flagpilot.types import (
     Decision,
     HealthNotifier,
+    MonotonicityCheck,
     Plan,
+    PostRollbackVerification,
     RolloutChange,
     RolloutRunResult,
     StageMetrics,
@@ -48,6 +50,8 @@ def append_audit_entry(
     sample_count: int | None = None,
     health_status: str | None = None,
     webhook_sent: bool | None = None,
+    retained_from_previous_stage: dict[str, object] | None = None,
+    verified: bool | None = None,
 ) -> None:
     """Append a secret-free decision entry with UTC timestamp to ``audit.log``."""
     if audit_log_path is None:
@@ -71,9 +75,58 @@ def append_audit_entry(
         entry["health_status"] = health_status
     if webhook_sent is not None:
         entry["webhook_sent"] = webhook_sent
+    if retained_from_previous_stage is not None:
+        entry["retained_from_previous_stage"] = retained_from_previous_stage
+    if verified is not None:
+        entry["verified"] = verified
     audit_log_path.parent.mkdir(parents=True, exist_ok=True)
     with audit_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry) + "\n")
+
+
+def _compute_monotonicity_check(
+    prev_percentage: int | None,
+    prev_exposed: frozenset[str] | None,
+    curr_percentage: int,
+    curr_exposed: tuple[str, ...] | None,
+) -> MonotonicityCheck | None:
+    """Verify that every identity exposed at the prior stage stays exposed on step-up."""
+    if prev_percentage is None or prev_exposed is None or curr_exposed is None:
+        return None
+    curr_set = frozenset(curr_exposed)
+    retained = len(prev_exposed & curr_set)
+    prev_count = len(prev_exposed)
+    curr_count = len(curr_set)
+    monotonic = prev_exposed.issubset(curr_set)
+    pct = (retained / prev_count * 100.0) if prev_count > 0 else 100.0
+    pct_str = f"{int(pct)}%" if pct.is_integer() else f"{pct:.1f}%"
+    summary = (
+        f"{retained}/{prev_count} ({pct_str}) of {prev_percentage}% users stayed enrolled "
+        f"at {curr_percentage}%"
+    )
+    return MonotonicityCheck(
+        from_percentage=prev_percentage,
+        to_percentage=curr_percentage,
+        retained_count=retained,
+        previous_exposed_count=prev_count,
+        current_exposed_count=curr_count,
+        monotonic=monotonic,
+        summary=summary,
+    )
+
+
+def monotonicity_check_to_dict(check: MonotonicityCheck) -> dict[str, object]:
+    """Serialize a MonotonicityCheck to a plain dictionary."""
+    return {
+        "from_percentage": check.from_percentage,
+        "to_percentage": check.to_percentage,
+        "retained_count": check.retained_count,
+        "previous_exposed_count": check.previous_exposed_count,
+        "current_exposed_count": check.current_exposed_count,
+        "retention_percentage": round(check.retention_percentage, 2),
+        "monotonic": check.monotonic,
+        "summary": check.summary,
+    }
 
 
 def evaluate_stage(
@@ -200,6 +253,7 @@ class RolloutController:
         output_stream: TextIO | None = None,
         rollback_to_zero: bool = False,
         health_notifier: HealthNotifier | None = None,
+        step_approve: bool = False,
     ) -> None:
         if interval_seconds < 0:
             raise ValueError("interval_seconds must be >= 0.")
@@ -211,6 +265,7 @@ class RolloutController:
         self._output_stream = output_stream if output_stream is not None else sys.stdout
         self._rollback_to_zero = rollback_to_zero
         self._health_notifier = health_notifier
+        self._step_approve = step_approve
 
     def _log_decision(
         self,
@@ -225,6 +280,8 @@ class RolloutController:
         sample_count: int | None = None,
         health_status: str | None = None,
         webhook_sent: bool | None = None,
+        retained_from_previous_stage: dict[str, object] | None = None,
+        verified: bool | None = None,
     ) -> None:
         append_audit_entry(
             self._audit_log_path,
@@ -239,6 +296,46 @@ class RolloutController:
             sample_count=sample_count,
             health_status=health_status,
             webhook_sent=webhook_sent,
+            retained_from_previous_stage=retained_from_previous_stage,
+            verified=verified,
+        )
+
+    def _verify_post_rollback(
+        self,
+        plan: Plan,
+        target_percentage: int,
+    ) -> PostRollbackVerification | None:
+        """Run one verification tick after rolling back to confirm exposure reset."""
+        if target_percentage != 0:
+            return None
+        verify_fn = getattr(self._signal_provider, "verify_rollback", None)
+        if not callable(verify_fn):
+            return None
+        metrics = verify_fn(plan, target_percentage)
+        verified = metrics.enabled_count == 0
+        summary = (
+            f"{metrics.enabled_count}/{metrics.sample_count} exposed identities "
+            f"after rollback to {target_percentage}%"
+        )
+        self._output_stream.write(
+            f"Post-rollback verification: {summary} (verified={verified})\n"
+        )
+        self._log_decision(
+            plan,
+            action="post_rollback_verification",
+            old_percentage=target_percentage,
+            new_percentage=target_percentage,
+            reason=summary,
+            exposed_count=metrics.enabled_count,
+            sample_count=metrics.sample_count,
+            verified=verified,
+        )
+        return PostRollbackVerification(
+            target_percentage=target_percentage,
+            exposed_count=metrics.enabled_count,
+            sample_count=metrics.sample_count,
+            verified=verified,
+            summary=summary,
         )
 
     def run(self, plan: Plan, *, is_synthetic: bool = True) -> RolloutRunResult:
@@ -247,10 +344,36 @@ class RolloutController:
         steps = plan.steps
         previous_safe_percentage = 0
         current_percentage = 0
+        prev_stage_pct: int | None = None
+        prev_exposed_ids: frozenset[str] | None = None
+
+        if not self._step_approve:
+            try:
+                self._writer.authorize_run(plan, rollback_to_zero=self._rollback_to_zero)
+            except ApprovalDeniedError as exc:
+                self._log_decision(
+                    plan,
+                    action="aborted",
+                    old_percentage=0,
+                    new_percentage=0,
+                    reason=str(exc),
+                )
+                self._output_stream.write(f"Rollout aborted: {exc}\n")
+                return RolloutRunResult(
+                    plan=plan,
+                    final_status="aborted",
+                    outcomes=(),
+                    rollback_applied=False,
+                    is_synthetic=is_synthetic,
+                )
 
         for index, step in enumerate(steps):
             try:
-                self._writer.apply_stage(plan, step.percentage)
+                self._writer.apply_stage(
+                    plan,
+                    step.percentage,
+                    use_run_approval=not self._step_approve,
+                )
             except ApprovalDeniedError as exc:
                 status = "aborted" if not outcomes else "paused"
                 self._log_decision(
@@ -274,6 +397,20 @@ class RolloutController:
                 self._sleep_fn(self._interval_seconds)
 
             metrics = self._signal_provider.collect(plan, step)
+            monotonic_check = _compute_monotonicity_check(
+                prev_stage_pct,
+                prev_exposed_ids,
+                step.percentage,
+                metrics.exposed_identities,
+            )
+            if monotonic_check is not None:
+                self._output_stream.write(
+                    f"Monotonicity check: {monotonic_check.summary}\n"
+                )
+            prev_stage_pct = step.percentage
+            if metrics.exposed_identities is not None:
+                prev_exposed_ids = frozenset(metrics.exposed_identities)
+
             next_step = steps[index + 1] if index + 1 < len(steps) else None
             rollback_target = (
                 plan.rollback_percentage if self._rollback_to_zero else previous_safe_percentage
@@ -292,6 +429,7 @@ class RolloutController:
                     metrics=metrics,
                     decision=decision,
                     applied=True,
+                    retained_from_previous_stage=monotonic_check,
                 )
             )
             self._log_decision(
@@ -307,6 +445,11 @@ class RolloutController:
                 observed_error_rate=decision.observed_error_rate,
                 exposed_count=metrics.enabled_count,
                 sample_count=metrics.sample_count,
+                retained_from_previous_stage=(
+                    monotonicity_check_to_dict(monotonic_check)
+                    if monotonic_check is not None
+                    else None
+                ),
             )
 
             if decision.action in ("hold", "pause"):
@@ -331,6 +474,7 @@ class RolloutController:
                         plan,
                         target_percentage=rollback_target,
                         reason=decision.reason,
+                        use_run_approval=not self._step_approve,
                     )
                 except ApprovalDeniedError as exc:
                     self._log_decision(
@@ -349,6 +493,7 @@ class RolloutController:
                         rollback_applied=False,
                         is_synthetic=is_synthetic,
                     )
+                verification = self._verify_post_rollback(plan, rollback_target)
                 health_status, webhook_sent = _notify_and_record_health(
                     self._health_notifier,
                     plan,
@@ -368,6 +513,7 @@ class RolloutController:
                     is_synthetic=is_synthetic,
                     health_status=health_status,
                     health_webhook_sent=webhook_sent,
+                    post_rollback_verification=verification,
                 )
 
             previous_safe_percentage = step.percentage

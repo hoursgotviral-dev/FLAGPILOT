@@ -67,6 +67,19 @@ class _SyntheticSignalProvider:
         print(round_result.format_summary())
         return round_result.to_stage_metrics(step.percentage)
 
+    def verify_rollback(self, plan: Plan, target_percentage: int) -> StageMetrics:
+        """Evaluate persistent identities after rollback to confirm exposure reset."""
+        min_samples = plan.steps[0].min_samples if plan.steps else 20
+        max_error_rate = plan.steps[0].max_error_rate if plan.steps else 0.02
+        return self.collect(
+            plan,
+            Step(
+                percentage=target_percentage,
+                min_samples=min_samples,
+                max_error_rate=max_error_rate,
+            ),
+        )
+
 
 def _add_plan_target_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--plan", type=Path, default=None, help="Path to plan JSON")
@@ -195,6 +208,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Roll back directly to 0%% on threshold breach instead of previous safe stage",
     )
+    run_parser.add_argument(
+        "--step-approve",
+        action="store_true",
+        help="Require APPROVE before each stage and rollback instead of upfront schedule approval",
+    )
     run_parser.add_argument("--audit-log", type=Path, default=Path("audit.log"))
 
     rollback_parser = subparsers.add_parser(
@@ -316,6 +334,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         audit_log_path=args.audit_log,
         rollback_to_zero=args.rollback_to_zero,
         health_notifier=backend if isinstance(backend, HealthNotifier) else None,
+        step_approve=args.step_approve,
     )
     try:
         result = controller.run(plan, is_synthetic=True)
@@ -325,6 +344,9 @@ def _handle_run(args: argparse.Namespace) -> int:
             close_fn()
 
     print(f"[{SYNTHETIC_LABEL}] Rollout finished with status: {result.final_status}")
+    if result.post_rollback_verification is not None:
+        v = result.post_rollback_verification
+        print(f"Post-rollback verification: {v.summary} (verified={v.verified})")
     if result.health_status is not None:
         delivery = "webhook delivered" if result.health_webhook_sent else "webhook skipped or failed"
         print(f"Feature Health: {result.health_status} ({delivery})")

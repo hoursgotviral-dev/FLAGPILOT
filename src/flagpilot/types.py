@@ -66,6 +66,7 @@ class StageMetrics:
     enabled_count: int
     source_label: str = "SYNTHETIC DATA"
     reported_error_rate: float | None = None
+    exposed_identities: tuple[str, ...] | None = None
 
     @property
     def error_rate(self) -> float:
@@ -90,6 +91,37 @@ class RolloutChange:
 
 
 @dataclass(frozen=True)
+class MonotonicityCheck:
+    """Retention check proving prior-stage exposed users stay enrolled on step-up."""
+
+    from_percentage: int
+    to_percentage: int
+    retained_count: int
+    previous_exposed_count: int
+    current_exposed_count: int
+    monotonic: bool
+    summary: str
+
+    @property
+    def retention_percentage(self) -> float:
+        """Percentage of previously exposed identities still exposed at the new stage."""
+        if self.previous_exposed_count <= 0:
+            return 100.0
+        return (self.retained_count / self.previous_exposed_count) * 100.0
+
+
+@dataclass(frozen=True)
+class PostRollbackVerification:
+    """Verification evaluation tick confirming exposure after automatic rollback."""
+
+    target_percentage: int
+    exposed_count: int
+    sample_count: int
+    verified: bool
+    summary: str
+
+
+@dataclass(frozen=True)
 class StageOutcome:
     """Recorded outcome of executing and evaluating one rollout stage."""
 
@@ -97,6 +129,7 @@ class StageOutcome:
     metrics: StageMetrics
     decision: Decision
     applied: bool
+    retained_from_previous_stage: MonotonicityCheck | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +144,7 @@ class RolloutRunResult:
     is_synthetic: bool = True
     health_status: str | None = None
     health_webhook_sent: bool | None = None
+    post_rollback_verification: PostRollbackVerification | None = None
 
 
 @runtime_checkable
