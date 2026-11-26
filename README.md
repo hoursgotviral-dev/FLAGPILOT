@@ -1,5 +1,7 @@
 # FlagPilot
 
+![FlagPilot Rollout Report showing monotonic 1% to 10% to 50% retention, 26.32% error-spike rollback to 0%, 0/200 post-rollback verification, and Grafana Feature Health UNHEALTHY/HEALTHY webhooks](docs/assets/rollout-report.png)
+
 ## The problem
 
 Feature flag rollouts often jump straight from disabled to 100% or rely on ad-hoc dashboard clicks with no repeatable safety net. When an error spike hits mid-rollout, operators have to scramble to diagnose which cohort is affected and manually revert state without an audit trail. Self-hosted teams need a terminal-first workflow that plans percentage stages deterministically, enforces explicit human sign-off on every change, and rolls back automatically when error rates breach a threshold.
@@ -9,9 +11,9 @@ Feature flag rollouts often jump straight from disabled to 100% or rely on ad-ho
 FlagPilot orchestrates staged **% Split** (`PERCENTAGE_SPLIT`) rollouts on self-hosted Flagsmith through four safeguards:
 
 1. **Zero-key deterministic planning (`planner.py`)**: A rule-based parser turns a plain-English rollout request into `plan.json` and `plan.md` with no LLM, no external API keys, and zero network calls by default. An optional thin `plan_with_llm()` adapter (enabled only via `--use-llm` or `FLAGPILOT_LLM_PROVIDER` + `GEMINI_API_KEY`/`OPENAI_API_KEY`) requests strict `Plan` JSON via standard-library `urllib.request`, validates through `plan_from_dict()`, falls back cleanly to the deterministic parser on error, and passes through the identical diff review and mandatory `APPROVE` gate.
-2. **Mandatory human approval (`apply.py`)**: Every Flagsmith mutation requires an interactive TTY where the operator types exact `APPROVE`; non-interactive runs refuse and there is no `--auto-approve` or `--yes` flag.
+2. **Mandatory human approval (`apply.py`)**: Every Flagsmith mutation requires an interactive TTY where the operator types exact `APPROVE`; non-interactive runs refuse and there is no `--auto-approve` or `--yes` flag. On `flagpilot run`, one upfront `APPROVE` authorizes the full stage schedule and safety policy so stages and emergency rollback execute automatically without mid-incident prompts (per-stage prompts remain opt-in via `--step-approve`).
 3. **Stable persistent identities (`simulator.py`)**: Evaluations always supply persistent identities (`user_000`..`user_199` by default) because Flagsmith `% Split` hashing does not work on anonymous requests, with all simulated data labelled `SYNTHETIC DATA`.
-4. **Deterministic rollback & audit trail (`controller.py`, `report.py`)**: Advances through configurable stages (default `1% -> 10% -> 50% -> 100%`), rolls back to the previous safe percentage (or `0%` with `--rollback-to-zero`) if errors exceed the threshold (default `2%`), notifies Flagsmith Feature Health (`FLAGSMITH_HEALTH_WEBHOOK_URL`) on rollback/completion in a fail-safe way, logs every decision to `audit.log` in UTC without secrets, and builds static `reports/rollout.html`.
+4. **Deterministic rollback, monotonic proof & Rich UI (`controller.py`, `report.py`)**: Advances through configurable stages (default `1% -> 10% -> 50% -> 100%`) in a live `rich` rollout table (`--plain` for plain text), tracks exact exposed identity IDs per stage (`retained_from_previous_stage` monotonicity proof), automatically rolls back to the previous safe percentage or `0%` (`--rollback-to-zero`, default in demo runners) on error breach, runs a post-rollback `0/200` verification tick, notifies Flagsmith Grafana Feature Health (`FLAGSMITH_HEALTH_WEBHOOK_URL`) fail-safely (`UNHEALTHY` on rollback -> `HEALTHY` on completion/reset), logs every decision in UTC to `audit.log` without secrets, and renders `reports/rollout.html`.
 
 ## Architecture
 
@@ -62,9 +64,9 @@ If you delete Flagsmith's `PERCENTAGE_SPLIT` segment rules and SDK evaluation fr
 | Target | Command / File | Purpose |
 | --- | --- | --- |
 | `bootstrap` | `flagpilot bootstrap` | Zero-UI setup against `http://localhost:8000`; writes `.env` idempotently. |
-| `plan` | `flagpilot plan "<request>"` | Deterministically parse request and write `plan.json` + `plan.md` offline. |
+| `plan` | `flagpilot plan "<request>"` | Parse request offline (`--use-llm` optional via `plan_with_llm()`), render Rich panel (`--plain` fallback), write `plan.json` + `plan.md`. |
 | `apply` | `flagpilot apply plan.json` | Print plan, require exact `APPROVE`, and apply target percentage to Flagsmith. |
-| `run` | `flagpilot run ...` | Run staged rollout (`1 -> 10 -> 50 -> 100`), watch error rate, roll back on breach. |
+| `run` | `flagpilot run ...` | Require upfront policy `APPROVE` (`--step-approve` opt-in), render live table, verify monotonic retention, auto-roll back (`--rollback-to-zero`) + verify `0/200`, notify Feature Health. |
 | `rollback` | `flagpilot rollback ...` | Gate and apply a `0%` rollback and disable segment override, logging to `audit.log`. |
 | `report` | `flagpilot report` | Read `audit.log` and `reports/last_run.json` and render static `reports/rollout.html`. |
 | Task runners | `scripts/demo`, `Makefile`, `tasks.ps1` | Cross-platform `up`, `bootstrap`, `down`, `test`, `lint`, `smoke`, and `demo`. |
@@ -74,8 +76,8 @@ If you delete Flagsmith's `PERCENTAGE_SPLIT` segment rules and SDK evaluation fr
 | Failure Mode | How FlagPilot Handles It |
 | --- | --- |
 | **Unstable identities** | `load_or_create_identities()` generates and persists ordered IDs (`user_000..`), and `FlagsmithSDKEvaluator.evaluate()` rejects empty identifiers so `% Split` hashing stays consistent across stages. |
-| **Writes without approval** | Every Flagsmith mutation routes through `ApprovedFlagsmithWriter` -> `require_approval()` in `apply.py`, which rejects non-TTY stdin and anything other than exact `APPROVE` with no bypass flag. |
-| **Runaway rollout** | `RolloutController` stops advancing whenever observed error rate exceeds `max_error_rate` (default `2%`), prints the reason, and gates a rollback to the previous safe percentage (or `0%` with `--rollback-to-zero`). |
+| **Writes without approval** | Every Flagsmith mutation routes through `ApprovedFlagsmithWriter` -> `require_approval()` in `apply.py`, which rejects non-TTY stdin and anything other than exact `APPROVE` with no bypass flag (including LLM-generated plans). |
+| **Runaway rollout** | `RolloutController` stops advancing whenever observed error rate exceeds `max_error_rate` (default `2%`), automatically executes rollback to `0%` (with `--rollback-to-zero`) or previous safe stage, runs a post-rollback `0/200` exposure check, and sends a fail-safe `firing` (`UNHEALTHY`) Feature Health webhook. |
 | **Unlabelled synthetic data** | `simulator.py`, `types.py`, `report.py`, and `cli.py` tag all simulated evaluations, metrics, summaries, and HTML/Markdown reports with `SYNTHETIC DATA`. |
 | **Flagsmith unreachable** | `FlagsmithManagementClient` wraps `requests.RequestException` and HTTP errors into `FlagsmithAPIError` with sanitized response bodies (keys scrubbed to `[REDACTED]`); `plan`, `report`, and `OfflineFakeEvaluator` run offline. |
 
@@ -99,7 +101,7 @@ docker compose up -d
 .\tasks.ps1 demo
 ```
 
-During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when prompted for each Flagsmith change; after completion, open `reports/rollout.html` in any browser.
+During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when prompted (`apply`, one-shot upfront policy `APPROVE` for `run` with `--rollback-to-zero`, and cleanup `rollback` reset); after completion, open `reports/rollout.html` in any browser.
 
 ## Repository map
 
@@ -117,7 +119,8 @@ During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when pr
 │   └── demo                         # Executable POSIX demo (ensures Flagsmith up, bootstraps .env if absent, runs demo)
 ├── docs/
 │   ├── ARCHITECTURE.md              # Component design, safety boundaries, and data flow
-│   └── SELF_HOSTING.md              # Zero-click self-hosted Flagsmith setup & verification guide
+│   ├── SELF_HOSTING.md              # Zero-click self-hosted Flagsmith setup & verification guide
+│   └── assets/rollout-report.png    # Verified full-page screenshot of reports/rollout.html
 ├── src/flagpilot/
 │   ├── types.py                     # Frozen dataclasses (Plan, Step, Decision) & FlagsmithClient Protocol
 │   ├── bootstrap.py                 # Idempotent zero-UI Flagsmith bootstrap writing local .env
