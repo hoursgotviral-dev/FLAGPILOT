@@ -106,7 +106,7 @@ During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when pr
 ```text
 .
 ├── .github/workflows/ci.yml         # GitHub Actions CI (ruff + offline pytest on Python 3.11 & 3.13)
-├── pyproject.toml                   # Python >=3.11 packaging, deps (requests, python-dotenv, flagsmith), pytest markers
+├── pyproject.toml                   # Python >=3.11 packaging, deps (requests, python-dotenv, flagsmith, rich), pytest markers
 ├── docker-compose.yml               # Official self-hosted Flagsmith + Postgres compose stack
 ├── .env.example                     # Placeholder env vars (FLAGSMITH_API_URL, keys, project/feature/segment IDs)
 ├── .gitattributes                   # Enforces LF on *.sh, scripts/demo, Makefile; CRLF on *.ps1
@@ -150,5 +150,5 @@ During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when pr
 
 ## Development status
 
-- **Unit CI (`pytest -v` & `ruff check src tests` via `.github/workflows/ci.yml`)**: `41` offline tests pass (`1` live test skipped unless `FLAGPILOT_LIVE_TEST=1`) and `ruff` passes with zero issues across Python `3.11` and `3.13`.
+- **Unit CI (`pytest -v` & `ruff check src tests` via `.github/workflows/ci.yml`)**: `43` offline tests pass (`1` live test skipped unless `FLAGPILOT_LIVE_TEST=1`) and `ruff` passes with zero issues across Python `3.11` and `3.13`. Also supports `--plain` for deterministic plain-text CI logs alongside Rich terminal panels/tables.
 - **Live Flagsmith integration (`FLAGPILOT_LIVE_TEST=1 pytest -m live -v`)**: Verified against live self-hosted Flagsmith `2.295.2` (`1 passed`), covering idempotent `bootstrap`, single upfront `APPROVE` policy gate, monotonic `1% -> 10% -> 50%` retention proof, automatic `0%` rollback + `0/200` post-rollback verification on fault spike, Grafana Feature Health `UNHEALTHY`/`HEALTHY` webhook delivery, `audit.log` recording, and static `reports/rollout.html`.
