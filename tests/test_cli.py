@@ -328,3 +328,119 @@ def test_cli_run_upfront_approve_and_step_approve_flag(
     assert code2 == 1
     assert client2.calls == [("apply", 1)]
     capsys.readouterr()
+
+
+def test_cli_plan_and_run_rich_and_plain_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI plan and run emit Rich tables/panels without ANSI on pipes and clean --plain output."""
+    plan_code = main(
+        [
+            "plan",
+            "roll out checkout_v2 through 1%, 10%, 50%, 100% in Development, rollback if errors exceed 2%",
+            "--out-dir",
+            str(tmp_path),
+        ]
+    )
+    assert plan_code == 0
+    plan_out = capsys.readouterr().out
+    assert "\x1b[" not in plan_out
+    assert "FlagPilot Rollout Plan" in plan_out
+    assert "0% → 1% → 10% → 50% → 100%" in plan_out
+
+    plain_plan_code = main(
+        [
+            "--plain",
+            "plan",
+            "--feature",
+            "checkout_v2",
+            "--env",
+            "Development",
+            "--out-dir",
+            str(tmp_path),
+        ]
+    )
+    assert plain_plan_code == 0
+    plain_plan_out = capsys.readouterr().out
+    assert "\x1b[" not in plain_plan_out
+    assert "╭" not in plain_plan_out
+    assert "Stage Progression: 0% -> 1% -> 10% -> 50% -> 100%" in plain_plan_out
+
+    monkeypatch.setenv("FLAGSMITH_API_URL", "http://localhost:8000/api/v1")
+    monkeypatch.setenv("FLAGSMITH_ADMIN_KEY", "dummy-admin")
+
+    # Rich run output (non-TTY capsys -> zero ANSI codes, full table + rollback panel)
+    client_rich = _FakeBackend()
+    stdin_rich = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin_rich, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin_rich)
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=client_rich):
+        run_rich_code = main(
+            [
+                "run",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--spike-rate",
+                "0.25",
+                "--spike-threshold-pct",
+                "25",
+                "--rollback-to-zero",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(tmp_path / "audit_rich.log"),
+                "--run-out",
+                str(tmp_path / "run_rich.json"),
+                "--report-out",
+                str(tmp_path / "rich.html"),
+            ]
+        )
+    assert run_rich_code == 1
+    run_rich_out = capsys.readouterr().out
+    assert "\x1b[" not in run_rich_out
+    assert "Exposed Identities" in run_rich_out
+    assert "Retention Proof" in run_rich_out
+    assert "Error Rate vs. Threshold" in run_rich_out
+    assert "ROLLBACK EXECUTED → 0%" in run_rich_out
+    assert "VERIFIED 0/200 EXPOSED" in run_rich_out
+
+    # --plain run output -> no table borders, no ANSI codes, deterministic verification line
+    client_plain = _FakeBackend()
+    stdin_plain = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin_plain, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin_plain)
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=client_plain):
+        run_plain_code = main(
+            [
+                "run",
+                "--plain",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--spike-rate",
+                "0.25",
+                "--spike-threshold-pct",
+                "25",
+                "--rollback-to-zero",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(tmp_path / "audit_plain.log"),
+                "--run-out",
+                str(tmp_path / "run_plain.json"),
+                "--report-out",
+                str(tmp_path / "plain.html"),
+            ]
+        )
+    assert run_plain_code == 1
+    run_plain_out = capsys.readouterr().out
+    assert "\x1b[" not in run_plain_out
+    assert "┃" not in run_plain_out
+    assert "VERIFIED 0/200 EXPOSED" in run_plain_out

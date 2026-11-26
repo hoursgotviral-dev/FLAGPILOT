@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import json
 from pathlib import Path
 
@@ -11,8 +12,10 @@ import pytest
 from flagpilot.planner import (
     SUPPORTED_PHRASES,
     PlanParseError,
+    build_plan,
     parse_plain_english_request,
     render_plan_markdown,
+    render_plan_summary,
     save_plan_artifacts,
 )
 
@@ -97,4 +100,28 @@ def test_render_plan_markdown_describes_rollback_and_pause_modes() -> None:
     assert rollback_plan.on_breach == "rollback"
     assert [s.percentage for s in rollback_plan.steps] == [1, 10, 50, 100]
     assert "roll back" in render_plan_markdown(rollback_plan)
+
+
+def test_render_plan_summary_rich_panel_and_plain_fallback() -> None:
+    """render_plan_summary outputs bordered Rich panel without ANSI on pipes and plain fallback."""
+    plan = build_plan("checkout_v2", "Development", stages=(1, 10, 50, 100))
+
+    rich_buf = io.StringIO()
+    render_plan_summary(plan, plain=False, output_stream=rich_buf)
+    rich_out = rich_buf.getvalue()
+    assert "\x1b[" not in rich_out
+    assert "FlagPilot Rollout Plan" in rich_out
+    assert "checkout_v2" in rich_out
+    assert "Development" in rich_out
+    assert "0% → 1% → 10% → 50% → 100%" in rich_out
+    assert "2.00%" in rich_out
+    assert "Planned Flagsmith API Calls" in rich_out
+
+    plain_buf = io.StringIO()
+    render_plan_summary(plan, plain=True, output_stream=plain_buf)
+    plain_out = plain_buf.getvalue()
+    assert "\x1b[" not in plain_out
+    assert "╭" not in plain_out
+    assert "Stage Progression: 0% -> 1% -> 10% -> 50% -> 100%" in plain_out
+    assert "Planned Flagsmith API Calls:" in plain_out
 

@@ -536,6 +536,42 @@ def test_controller_upfront_approve_non_interactive_abort_and_step_approve_opt_i
     assert verif.sample_count == 200
     assert verif.verified is True
     assert verif.summary == "0/200 exposed identities after rollback to 0%"
+    ctrl_text = ctrl_out.getvalue()
+    assert "\x1b[" not in ctrl_text
+    assert "ROLLBACK EXECUTED → 0%" in ctrl_text
+    assert "VERIFIED 0/200 EXPOSED" in ctrl_text
+
+    # Simulated TTY stream exercises Rich Live table rendering cleanly
+    client_tty = _FakeFlagsmithClient()
+    eval_tty = OfflineFakeEvaluator()
+    sim_tty = TrafficSimulator(
+        eval_tty,
+        user_count=200,
+        seed=42,
+        baseline_rate=0.005,
+        error_rate_fn=make_error_rate_fn(
+            baseline_rate=0.005,
+            spike_rate=0.25,
+            spike_threshold_pct=25.0,
+        ),
+    )
+    tty_out = io.StringIO()
+    tty_out.isatty = lambda: True  # type: ignore[method-assign]
+    res_tty = RolloutController(
+        ApprovedFlagsmithWriter(
+            client_tty,
+            input_stream=io.StringIO("APPROVE\n"),
+            output_stream=io.StringIO(),
+            is_tty=True,
+        ),
+        _VerifyingSignalProvider(eval_tty, sim_tty),
+        audit_log_path=tmp_path / "tty.log",
+        output_stream=tty_out,
+        rollback_to_zero=True,
+    ).run(build_plan("checkout_v2", "Development"))
+    assert res_tty.final_status == "rolled_back"
+    assert "ROLLBACK EXECUTED" in tty_out.getvalue()
+    assert "VERIFIED 0/200 EXPOSED" in tty_out.getvalue()
 
     rows = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()]
     assert rows[1]["retained_from_previous_stage"]["monotonic"] is True
