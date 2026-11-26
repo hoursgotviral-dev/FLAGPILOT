@@ -39,7 +39,7 @@ demo-plan:
 demo-apply:
 	$(FLAGPILOT) apply plan.json
 
-# HUMAN INTERACTION REQUIRED: type APPROVE for each stage (1%, 10%, 50%) and triggered rollback (10%)
+# HUMAN INTERACTION REQUIRED: type APPROVE once upfront for schedule & auto-rollback to 0%
 demo-run:
 	$(FLAGPILOT) run \
 		--feature checkout_v2 \
@@ -50,14 +50,15 @@ demo-run:
 		--spike-rate 0.25 \
 		--spike-threshold-pct 25 \
 		--seed 42 \
-		--interval 0
+		--interval 0 \
+		--rollback-to-zero
 
 # HUMAN INTERACTION REQUIRED: type APPROVE when prompted
 demo-rollback:
 	$(FLAGPILOT) rollback \
 		--feature checkout_v2 \
 		--env Development \
-		--old-percentage 10 \
+		--old-percentage 0 \
 		--reason "demo cleanup"
 
 demo-report:

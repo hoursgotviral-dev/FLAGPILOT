@@ -65,6 +65,7 @@ class BootstrapResult:
     preserved_master_key: bool
     preserved_server_key: bool
     env_path: Path
+    has_health_webhook: bool = False
 
 
 def _scrub(text: str, secrets: Sequence[str]) -> str:
@@ -81,6 +82,60 @@ def _extract_results(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict) and isinstance(payload.get("results"), list):
         return list(payload["results"])
     return []
+
+
+def _ensure_grafana_health_provider(
+    session: requests.Session,
+    base: str,
+    project_id: int,
+    *,
+    headers: dict[str, str],
+    timeout: float,
+    secrets: list[str],
+    out: Any,
+) -> str:
+    """Idempotently fetch or create the project's Grafana Feature Health provider webhook URL."""
+    url = f"{base}/api/v1/projects/{project_id}/feature-health/providers/"
+    try:
+        existing_payload = _request_json(
+            session,
+            "GET",
+            url,
+            headers=headers,
+            timeout=timeout,
+            secrets=secrets,
+        )
+        providers = _extract_results(existing_payload)
+        provider = next(
+            (p for p in providers if str(p.get("name", "")).strip().lower() == "grafana"),
+            None,
+        )
+        if provider is None:
+            provider = _request_json(
+                session,
+                "POST",
+                url,
+                headers=headers,
+                json_body={"name": "Grafana"},
+                timeout=timeout,
+                secrets=secrets,
+            )
+            out.write(f"Created Grafana Feature Health provider for project id={project_id}\n")
+        else:
+            out.write(
+                f"Preserved existing Grafana Feature Health provider for project id={project_id}\n"
+            )
+    except BootstrapError as exc:
+        out.write(
+            f"Warning: Grafana Feature Health provider unavailable ({_scrub(str(exc), secrets)}); "
+            "continuing without FLAGSMITH_HEALTH_WEBHOOK_URL\n"
+        )
+        return ""
+
+    webhook_url = str((provider or {}).get("webhook_url") or "").strip()
+    if webhook_url:
+        secrets.append(webhook_url)
+    return webhook_url
 
 
 def _request_json(
@@ -234,7 +289,12 @@ def bootstrap_flagsmith(
         existing_env = {
             k: v for k, v in dotenv_values(config.env_path).items() if k and v is not None
         }
-        for secret_var in ("FLAGSMITH_ADMIN_KEY", "FLAGSMITH_SERVER_KEY", "FLAGSMITH_CLIENT_KEY"):
+        for secret_var in (
+            "FLAGSMITH_ADMIN_KEY",
+            "FLAGSMITH_SERVER_KEY",
+            "FLAGSMITH_CLIENT_KEY",
+            "FLAGSMITH_HEALTH_WEBHOOK_URL",
+        ):
             if existing_env.get(secret_var):
                 secrets.append(existing_env[secret_var])
 
@@ -443,20 +503,36 @@ def bootstrap_flagsmith(
         environment=client_key,
     )
 
-    # 7. Persist non-printed config + secrets into local .env
-    _upsert_env_file(
-        config.env_path,
-        {
-            "FLAGSMITH_API_URL": base,
-            "FLAGSMITH_ADMIN_KEY": master_key,
-            "FLAGSMITH_CLIENT_KEY": client_key,
-            "FLAGSMITH_SERVER_KEY": server_key,
-            "FLAGSMITH_ENVIRONMENT_KEY": client_key,
-            "FLAGSMITH_PROJECT_ID": str(project_id),
-            "FLAGSMITH_FEATURE_ID": str(feature_id),
-            "FLAGSMITH_SEGMENT_ID": str(segment_id),
-        },
+    # 7. Idempotently get or create Grafana Feature Health provider webhook URL
+    health_webhook_url = _ensure_grafana_health_provider(
+        http,
+        base,
+        project_id,
+        headers=api_key_headers,
+        timeout=config.timeout_seconds,
+        secrets=secrets,
+        out=out,
     )
+    if not health_webhook_url:
+        health_webhook_url = existing_env.get("FLAGSMITH_HEALTH_WEBHOOK_URL", "").strip()
+        if health_webhook_url:
+            secrets.append(health_webhook_url)
+
+    # 8. Persist non-printed config + secrets into local .env
+    env_updates: dict[str, str] = {
+        "FLAGSMITH_API_URL": base,
+        "FLAGSMITH_ADMIN_KEY": master_key,
+        "FLAGSMITH_CLIENT_KEY": client_key,
+        "FLAGSMITH_SERVER_KEY": server_key,
+        "FLAGSMITH_ENVIRONMENT_KEY": client_key,
+        "FLAGSMITH_PROJECT_ID": str(project_id),
+        "FLAGSMITH_FEATURE_ID": str(feature_id),
+        "FLAGSMITH_SEGMENT_ID": str(segment_id),
+    }
+    if health_webhook_url:
+        env_updates["FLAGSMITH_HEALTH_WEBHOOK_URL"] = health_webhook_url
+
+    _upsert_env_file(config.env_path, env_updates)
 
     out.write(
         f"Bootstrapped org_id={org_id} project_id={project_id} "
@@ -475,6 +551,7 @@ def bootstrap_flagsmith(
         preserved_master_key=preserved_master,
         preserved_server_key=preserved_server,
         env_path=config.env_path,
+        has_health_webhook=bool(health_webhook_url),
     )
 
 

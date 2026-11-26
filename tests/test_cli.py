@@ -231,3 +231,269 @@ def test_cli_bootstrap_subcommand(tmp_path: Path) -> None:
     with patch("flagpilot.cli.bootstrap_flagsmith", side_effect=BootstrapError("boom")):
         err_code = main(["bootstrap", "--env-file", str(env_file)])
     assert err_code == 1
+
+
+def test_cli_missing_file_returns_clean_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Missing input files return exit code 1 with concise Error output instead of traceback."""
+    missing = tmp_path / "does_not_exist.json"
+    code = main(["apply", str(missing)])
+    assert code == 1
+    assert "Error:" in capsys.readouterr().err
+
+
+def test_cli_run_upfront_approve_and_step_approve_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI run executes spike+0% rollback with 1 upfront APPROVE, or pauses with --step-approve."""
+    monkeypatch.setenv("FLAGSMITH_API_URL", "http://localhost:8000/api/v1")
+    monkeypatch.setenv("FLAGSMITH_ADMIN_KEY", "dummy-admin")
+
+    # Default (upfront single APPROVE) with --rollback-to-zero
+    client1 = _FakeBackend()
+    run_out = tmp_path / "last_run.json"
+    html_out = tmp_path / "rollout.html"
+    stdin1 = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin1, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin1)
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=client1):
+        code1 = main(
+            [
+                "run",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--spike-rate",
+                "0.25",
+                "--spike-threshold-pct",
+                "25",
+                "--rollback-to-zero",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(tmp_path / "audit1.log"),
+                "--run-out",
+                str(run_out),
+                "--report-out",
+                str(html_out),
+            ]
+        )
+    assert code1 == 1
+    assert client1.calls == [("apply", 1), ("apply", 10), ("apply", 50), ("rollback", 0)]
+    out1 = capsys.readouterr().out
+    assert "Post-rollback verification: 0/200 exposed identities after rollback to 0%" in out1
+
+    run_json = json.loads(run_out.read_text(encoding="utf-8"))
+    assert run_json["monotonic_enrollment"]["all_monotonic"] is True
+    assert run_json["outcomes"][1]["retained_from_previous_stage"]["monotonic"] is True
+    assert run_json["post_rollback_verification"]["exposed_count"] == 0
+    assert run_json["post_rollback_verification"]["sample_count"] == 200
+    assert run_json["post_rollback_verification"]["verified"] is True
+
+    html_doc = html_out.read_text(encoding="utf-8")
+    assert "0/200 exposed identities after rollback to 0%" in html_doc
+    assert "stayed enrolled" in html_doc
+
+    # Opt-in --step-approve with only 1 APPROVE pauses at stage 2
+    client2 = _FakeBackend()
+    stdin2 = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin2, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin2)
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=client2):
+        code2 = main(
+            [
+                "run",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--step-approve",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(tmp_path / "audit2.log"),
+                "--run-out",
+                str(tmp_path / "run2.json"),
+                "--report-out",
+                str(tmp_path / "html2.html"),
+            ]
+        )
+    assert code2 == 1
+    assert client2.calls == [("apply", 1)]
+    capsys.readouterr()
+
+
+def test_cli_plan_and_run_rich_and_plain_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI plan and run emit Rich tables/panels without ANSI on pipes and clean --plain output."""
+    plan_code = main(
+        [
+            "plan",
+            "roll out checkout_v2 through 1%, 10%, 50%, 100% in Development, rollback if errors exceed 2%",
+            "--out-dir",
+            str(tmp_path),
+        ]
+    )
+    assert plan_code == 0
+    plan_out = capsys.readouterr().out
+    assert "\x1b[" not in plan_out
+    assert "FlagPilot Rollout Plan" in plan_out
+    assert "0% → 1% → 10% → 50% → 100%" in plan_out
+
+    plain_plan_code = main(
+        [
+            "--plain",
+            "plan",
+            "--feature",
+            "checkout_v2",
+            "--env",
+            "Development",
+            "--out-dir",
+            str(tmp_path),
+        ]
+    )
+    assert plain_plan_code == 0
+    plain_plan_out = capsys.readouterr().out
+    assert "\x1b[" not in plain_plan_out
+    assert "╭" not in plain_plan_out
+    assert "Stage Progression: 0% -> 1% -> 10% -> 50% -> 100%" in plain_plan_out
+
+    monkeypatch.setenv("FLAGSMITH_API_URL", "http://localhost:8000/api/v1")
+    monkeypatch.setenv("FLAGSMITH_ADMIN_KEY", "dummy-admin")
+
+    # Rich run output (non-TTY capsys -> zero ANSI codes, full table + rollback panel)
+    client_rich = _FakeBackend()
+    stdin_rich = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin_rich, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin_rich)
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=client_rich):
+        run_rich_code = main(
+            [
+                "run",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--spike-rate",
+                "0.25",
+                "--spike-threshold-pct",
+                "25",
+                "--rollback-to-zero",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(tmp_path / "audit_rich.log"),
+                "--run-out",
+                str(tmp_path / "run_rich.json"),
+                "--report-out",
+                str(tmp_path / "rich.html"),
+            ]
+        )
+    assert run_rich_code == 1
+    run_rich_out = capsys.readouterr().out
+    assert "\x1b[" not in run_rich_out
+    assert "Exposed Identities" in run_rich_out
+    assert "Retention Proof" in run_rich_out
+    assert "Error Rate vs. Threshold" in run_rich_out
+    assert "ROLLBACK EXECUTED → 0%" in run_rich_out
+    assert "VERIFIED 0/200 EXPOSED" in run_rich_out
+
+    # --plain run output -> no table borders, no ANSI codes, deterministic verification line
+    client_plain = _FakeBackend()
+    stdin_plain = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin_plain, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin_plain)
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=client_plain):
+        run_plain_code = main(
+            [
+                "run",
+                "--plain",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--spike-rate",
+                "0.25",
+                "--spike-threshold-pct",
+                "25",
+                "--rollback-to-zero",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(tmp_path / "audit_plain.log"),
+                "--run-out",
+                str(tmp_path / "run_plain.json"),
+                "--report-out",
+                str(tmp_path / "plain.html"),
+            ]
+        )
+    assert run_plain_code == 1
+    run_plain_out = capsys.readouterr().out
+    assert "\x1b[" not in run_plain_out
+    assert "┃" not in run_plain_out
+    assert "VERIFIED 0/200 EXPOSED" in run_plain_out
+
+
+def test_cli_plan_use_llm_routes_through_adapter_and_keeps_approve_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Default plan never invokes LLM; --use-llm calls plan_with_llm and apply still enforces APPROVE."""
+    monkeypatch.delenv("FLAGPILOT_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    # 1. Default zero-key path does NOT invoke plan_with_llm
+    with patch("flagpilot.cli.plan_with_llm") as mock_llm:
+        default_code = main(
+            [
+                "plan",
+                "roll out checkout_v2 to 10% in Development, pause if errors exceed 2%",
+                "--out-dir",
+                str(tmp_path / "default"),
+            ]
+        )
+    assert default_code == 0
+    mock_llm.assert_not_called()
+
+    # 2. --use-llm invokes plan_with_llm, writes plan.json/plan.md without Flagsmith calls,
+    #    and apply STILL refuses non-interactive writes (mandatory APPROVE gate preserved).
+    llm_plan = build_plan("ai_checkout", "Development", stages=(1, 25, 100), max_error_rate=0.01)
+    llm_dir = tmp_path / "llm"
+    with patch("flagpilot.cli.plan_with_llm", return_value=llm_plan) as mock_llm:
+        llm_code = main(
+            [
+                "plan",
+                "Canary ai_checkout to 100% in Development with strict 1% safety",
+                "--use-llm",
+                "--out-dir",
+                str(llm_dir),
+            ]
+        )
+    assert llm_code == 0
+    mock_llm.assert_called_once()
+    assert (llm_dir / "plan.json").exists()
+    assert (llm_dir / "plan.md").exists()
+    assert "Exact API Calls That Would Run" in (llm_dir / "plan.md").read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("APPROVE\n"))
+    fake_backend = _FakeBackend()
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=fake_backend):
+        apply_code = main(["apply", str(llm_dir / "plan.json")])
+    assert apply_code == 1
+    assert fake_backend.calls == []
+    assert "non-interactive" in capsys.readouterr().err.lower()

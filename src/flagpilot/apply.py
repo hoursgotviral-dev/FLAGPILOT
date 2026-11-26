@@ -67,6 +67,28 @@ def _format_stage_summary(plan: Plan, percentage: int, *, action: str) -> str:
     )
 
 
+def _format_run_policy_summary(plan: Plan, *, rollback_to_zero: bool = False) -> str:
+    segment_name = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
+    schedule = " -> ".join(f"{step.percentage}%" for step in plan.steps)
+    min_samples = plan.steps[0].min_samples if plan.steps else 20
+    max_error_rate = plan.steps[0].max_error_rate if plan.steps else 0.02
+    rollback_policy = (
+        f"{plan.rollback_percentage}% (direct zero-exposure rollback)"
+        if rollback_to_zero
+        else "previous safe stage (or 0% on initial stage)"
+    )
+    return (
+        "Action: authorize_rollout_run\n"
+        f"Feature: {plan.feature_name}\n"
+        f"Environment: {plan.environment}\n"
+        f"Segment: {segment_name}\n"
+        f"Rollout schedule: {schedule}\n"
+        f"Safety policy: min_samples={min_samples}, max_error_rate={max_error_rate:.2%} -> "
+        f"auto-rollback to {rollback_policy}\n"
+        "Execution mode: stages and emergency rollback run automatically after this approval."
+    )
+
+
 class ApprovedFlagsmithWriter:
     """Write guard ensuring every Flagsmith mutation passes require_approval."""
 
@@ -85,6 +107,34 @@ class ApprovedFlagsmithWriter:
         self._is_tty = is_tty
         self._audit_log_path = audit_log_path
         self._segment_ids: dict[tuple[str, str], int] = {}
+        self._authorized_plans: list[Plan] = []
+
+    def _is_run_authorized(self, plan: Plan) -> bool:
+        return any(authorized is plan for authorized in self._authorized_plans)
+
+    def authorize_run(self, plan: Plan, *, rollback_to_zero: bool = False) -> None:
+        """Require upfront APPROVE for the entire rollout schedule and rollback safety policy."""
+        summary = _format_run_policy_summary(plan, rollback_to_zero=rollback_to_zero)
+        require_approval(
+            summary,
+            input_stream=self._input_stream,
+            output_stream=self._output_stream,
+            is_tty=self._is_tty,
+        )
+        if not self._is_run_authorized(plan):
+            self._authorized_plans.append(plan)
+        segment_name = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
+        self._record_audit(
+            "approve_run",
+            RolloutChange(
+                feature_name=plan.feature_name,
+                environment=plan.environment,
+                segment_name=segment_name,
+                percentage=0,
+                enabled=False,
+            ),
+            reason="approved rollout schedule and safety policy",
+        )
 
     def _record_audit(self, action: str, change: RolloutChange, reason: str = "") -> None:
         if self._audit_log_path is None:
@@ -153,15 +203,22 @@ class ApprovedFlagsmithWriter:
 
         raise TypeError("Backend does not implement FlagsmithClient or RolloutBackend.")
 
-    def apply_stage(self, plan: Plan, percentage: int) -> RolloutChange:
+    def apply_stage(
+        self,
+        plan: Plan,
+        percentage: int,
+        *,
+        use_run_approval: bool = False,
+    ) -> RolloutChange:
         """Gate and apply a rollout stage percentage to Flagsmith."""
-        summary = _format_stage_summary(plan, percentage, action="apply_stage")
-        require_approval(
-            summary,
-            input_stream=self._input_stream,
-            output_stream=self._output_stream,
-            is_tty=self._is_tty,
-        )
+        if not (use_run_approval and self._is_run_authorized(plan)):
+            summary = _format_stage_summary(plan, percentage, action="apply_stage")
+            require_approval(
+                summary,
+                input_stream=self._input_stream,
+                output_stream=self._output_stream,
+                is_tty=self._is_tty,
+            )
         change = self._write_percentage(plan, percentage)
         self._record_audit("apply_stage", change)
         return change
@@ -180,20 +237,22 @@ class ApprovedFlagsmithWriter:
         *,
         target_percentage: int | None = None,
         reason: str = "",
+        use_run_approval: bool = False,
     ) -> RolloutChange:
         """Gate and apply a rollback to ``target_percentage`` (or ``plan.rollback_percentage``)."""
         resolved_target = (
             plan.rollback_percentage if target_percentage is None else target_percentage
         )
-        summary = _format_stage_summary(plan, resolved_target, action="rollback")
-        if reason:
-            summary = f"{summary}\nReason: {reason}"
-        require_approval(
-            summary,
-            input_stream=self._input_stream,
-            output_stream=self._output_stream,
-            is_tty=self._is_tty,
-        )
+        if not (use_run_approval and self._is_run_authorized(plan)):
+            summary = _format_stage_summary(plan, resolved_target, action="rollback")
+            if reason:
+                summary = f"{summary}\nReason: {reason}"
+            require_approval(
+                summary,
+                input_stream=self._input_stream,
+                output_stream=self._output_stream,
+                is_tty=self._is_tty,
+            )
         change = self._write_percentage(plan, resolved_target)
         self._record_audit("rollback", change, reason=reason)
         return change

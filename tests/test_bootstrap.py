@@ -56,6 +56,16 @@ def test_bootstrap_initial_and_idempotent_rerun(tmp_path: Path) -> None:
                 ],
             }
         ),
+        # Feature Health provider (GET empty -> POST Grafana)
+        _resp([]),
+        _resp(
+            {
+                "name": "Grafana",
+                "project": 20,
+                "webhook_url": "http://localhost:8000/api/v1/feature-health/hook-tok-1/",
+            },
+            201,
+        ),
     ]
 
     out1 = io.StringIO()
@@ -70,9 +80,11 @@ def test_bootstrap_initial_and_idempotent_rerun(tmp_path: Path) -> None:
     assert res1.segment_id == 50
     assert res1.preserved_master_key is False
     assert res1.preserved_server_key is False
+    assert res1.has_health_webhook is True
     assert "adm_master_1" not in out1.getvalue()
     assert "ser.srv_key_1" not in out1.getvalue()
     assert "user-tok-1" not in out1.getvalue()
+    assert "hook-tok-1" not in out1.getvalue()
 
     env_text = env_file.read_text(encoding="utf-8")
     assert "FLAGSMITH_API_URL=http://localhost:8000" in env_text
@@ -82,6 +94,10 @@ def test_bootstrap_initial_and_idempotent_rerun(tmp_path: Path) -> None:
     assert "FLAGSMITH_PROJECT_ID=20" in env_text
     assert "FLAGSMITH_FEATURE_ID=40" in env_text
     assert "FLAGSMITH_SEGMENT_ID=50" in env_text
+    assert (
+        "FLAGSMITH_HEALTH_WEBHOOK_URL=http://localhost:8000/api/v1/feature-health/hook-tok-1/"
+        in env_text
+    )
 
     # Run 2: has_users=True -> logs in, preserves existing master & server keys, updates existing resources
     session2 = MagicMock()
@@ -117,6 +133,16 @@ def test_bootstrap_initial_and_idempotent_rerun(tmp_path: Path) -> None:
                 ],
             }
         ),
+        # Feature Health provider already exists -> preserves without POST
+        _resp(
+            [
+                {
+                    "name": "Grafana",
+                    "project": 20,
+                    "webhook_url": "http://localhost:8000/api/v1/feature-health/hook-tok-1/",
+                }
+            ]
+        ),
     ]
 
     out2 = io.StringIO()
@@ -126,6 +152,8 @@ def test_bootstrap_initial_and_idempotent_rerun(tmp_path: Path) -> None:
     assert res2.preserved_server_key is True
     assert res2.feature_id == 40
     assert res2.segment_id == 50
+    assert res2.has_health_webhook is True
     assert "adm_master_1" not in out2.getvalue()
     assert "ser.srv_key_1" not in out2.getvalue()
+    assert "hook-tok-1" not in out2.getvalue()
 

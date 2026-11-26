@@ -13,6 +13,7 @@ dependencies = [
     "requests",
     "python-dotenv",
     "flagsmith",
+    "rich",
 ]
 
 [project.optional-dependencies]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -27,8 +28,11 @@ from flagpilot.planner import (
     DEFAULT_STAGES,
     PlanValidationError,
     build_plan,
+    is_llm_configured,
     load_plan,
     parse_plain_english_request,
+    plan_with_llm,
+    render_plan_summary,
     save_plan_artifacts,
 )
 from flagpilot.report import (
@@ -46,7 +50,7 @@ from flagpilot.simulator import (
     TrafficSimulator,
     make_error_rate_fn,
 )
-from flagpilot.types import FlagEvaluator, Plan, StageMetrics, Step
+from flagpilot.types import FlagEvaluator, HealthNotifier, Plan, StageMetrics, Step
 
 SUBCOMMANDS = ("bootstrap", "plan", "apply", "run", "rollback", "report")
 DEFAULT_MAX_ERROR_RATE = 0.02
@@ -55,16 +59,37 @@ DEFAULT_MAX_ERROR_RATE = 0.02
 class _SyntheticSignalProvider:
     """Adapter connecting persistent-identity TrafficSimulator to RolloutController."""
 
-    def __init__(self, evaluator: FlagEvaluator, simulator: TrafficSimulator) -> None:
+    def __init__(
+        self,
+        evaluator: FlagEvaluator,
+        simulator: TrafficSimulator,
+        *,
+        verbose: bool = True,
+    ) -> None:
         self._evaluator = evaluator
         self._simulator = simulator
+        self._verbose = verbose
 
     def collect(self, plan: Plan, step: Step) -> StageMetrics:
         if isinstance(self._evaluator, OfflineFakeEvaluator):
             self._evaluator.set_percentage(step.percentage)
         round_result = self._simulator.run_round(plan.feature_name)
-        print(round_result.format_summary())
+        if self._verbose:
+            print(round_result.format_summary())
         return round_result.to_stage_metrics(step.percentage)
+
+    def verify_rollback(self, plan: Plan, target_percentage: int) -> StageMetrics:
+        """Evaluate persistent identities after rollback to confirm exposure reset."""
+        min_samples = plan.steps[0].min_samples if plan.steps else 20
+        max_error_rate = plan.steps[0].max_error_rate if plan.steps else 0.02
+        return self.collect(
+            plan,
+            Step(
+                percentage=target_percentage,
+                min_samples=min_samples,
+                max_error_rate=max_error_rate,
+            ),
+        )
 
 
 def _add_plan_target_args(parser: argparse.ArgumentParser) -> None:
@@ -111,6 +136,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="flagpilot",
         description="Staged feature flag rollout controller for self-hosted Flagsmith.",
     )
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Disable Rich panels/tables and emit plain deterministic text",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     bootstrap_parser = subparsers.add_parser(
@@ -147,6 +177,17 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--out-dir", type=Path, default=Path("."))
     plan_parser.add_argument("--out", type=Path, default=None, help="Output plan JSON path")
     plan_parser.add_argument("--md-out", type=Path, default=None, help="Output plan Markdown path")
+    plan_parser.add_argument(
+        "--plain",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Render plain text summary instead of a Rich panel",
+    )
+    plan_parser.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="Opt into the optional LLM planner adapter (falls back to deterministic parser on error)",
+    )
 
     apply_parser = subparsers.add_parser("apply", help="Apply a plan (requires APPROVE)")
     apply_parser.add_argument("plan_file", nargs="?", type=Path, default=None, help="Path to plan.json")
@@ -193,6 +234,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--rollback-to-zero",
         action="store_true",
         help="Roll back directly to 0%% on threshold breach instead of previous safe stage",
+    )
+    run_parser.add_argument(
+        "--step-approve",
+        action="store_true",
+        help="Require APPROVE before each stage and rollback instead of upfront schedule approval",
+    )
+    run_parser.add_argument(
+        "--plain",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Render plain text progress instead of Rich tables and panels",
     )
     run_parser.add_argument("--audit-log", type=Path, default=Path("audit.log"))
 
@@ -245,12 +297,20 @@ def _handle_bootstrap(args: argparse.Namespace) -> int:
 
 def _handle_plan(args: argparse.Namespace) -> int:
     if args.request is not None:
-        plan = parse_plain_english_request(
-            args.request,
-            min_samples=args.min_samples,
-            project_id=args.project_id,
-            segment_name=args.segment_name,
-        )
+        if args.use_llm or is_llm_configured():
+            plan = plan_with_llm(
+                args.request,
+                min_samples=args.min_samples,
+                project_id=args.project_id,
+                segment_name=args.segment_name,
+            )
+        else:
+            plan = parse_plain_english_request(
+                args.request,
+                min_samples=args.min_samples,
+                project_id=args.project_id,
+                segment_name=args.segment_name,
+            )
     elif args.feature and args.env:
         plan = build_plan(
             feature_name=args.feature,
@@ -269,6 +329,7 @@ def _handle_plan(args: argparse.Namespace) -> int:
     json_path = args.out if args.out is not None else args.out_dir / "plan.json"
     md_path = args.md_out if args.md_out is not None else json_path.with_suffix(".md")
     save_plan_artifacts(plan, json_path=json_path, markdown_path=md_path)
+    render_plan_summary(plan, plain=bool(getattr(args, "plain", False)))
     print(f"Wrote {json_path} and {md_path} (no Flagsmith API calls made).")
     return 0
 
@@ -307,13 +368,22 @@ def _handle_run(args: argparse.Namespace) -> int:
         baseline_rate=args.baseline_error_rate,
         error_rate_fn=error_rate_fn,
     )
-    provider = _SyntheticSignalProvider(evaluator, simulator)
+    plain_mode = bool(getattr(args, "plain", False))
+    tty_stdout = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    provider = _SyntheticSignalProvider(
+        evaluator,
+        simulator,
+        verbose=plain_mode or not tty_stdout,
+    )
     controller = RolloutController(
         writer=writer,
         signal_provider=provider,
         interval_seconds=args.interval,
         audit_log_path=args.audit_log,
         rollback_to_zero=args.rollback_to_zero,
+        health_notifier=backend if isinstance(backend, HealthNotifier) else None,
+        step_approve=args.step_approve,
+        plain=plain_mode,
     )
     try:
         result = controller.run(plan, is_synthetic=True)
@@ -323,6 +393,12 @@ def _handle_run(args: argparse.Namespace) -> int:
             close_fn()
 
     print(f"[{SYNTHETIC_LABEL}] Rollout finished with status: {result.final_status}")
+    if result.post_rollback_verification is not None:
+        v = result.post_rollback_verification
+        print(f"Post-rollback verification: {v.summary} (verified={v.verified})")
+    if result.health_status is not None:
+        delivery = "webhook delivered" if result.health_webhook_sent else "webhook skipped or failed"
+        print(f"Feature Health: {result.health_status} ({delivery})")
     save_run_result(result, args.run_out)
     audit_entries = load_audit_log(args.audit_log)
     save_html_report(result, args.report_out, audit_entries=audit_entries)
@@ -340,6 +416,7 @@ def _handle_rollback(args: argparse.Namespace) -> int:
         old_percentage=args.old_percentage,
         reason=args.reason,
         audit_log_path=args.audit_log,
+        health_notifier=backend if isinstance(backend, HealthNotifier) else None,
     )
     return 0
 
@@ -370,7 +447,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (
         ApprovalDeniedError,
         BootstrapError,
+        FileNotFoundError,
         FlagsmithAPIError,
+        json.JSONDecodeError,
         PlanValidationError,
         ValueError,
     ) as exc:

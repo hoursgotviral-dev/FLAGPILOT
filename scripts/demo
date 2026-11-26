@@ -64,8 +64,8 @@ echo "=== [2/5] APPLY (HUMAN ACTION: type APPROVE when prompted) ==="
 "$FLAGPILOT_BIN" apply plan.json
 
 echo ""
-echo "=== [3/5] RUN WITH SEEDED ERROR SPIKE AT 50% (HUMAN ACTION: type APPROVE at each step & rollback) ==="
-# Expects exit code 1 when spike triggers auto-rollback at 50% -> 10%.
+echo "=== [3/5] RUN WITH SEEDED ERROR SPIKE AT 50% (HUMAN ACTION: type APPROVE once upfront for schedule & auto-rollback to 0%) ==="
+# Expects exit code 1 when spike triggers auto-rollback at 50% -> 0%.
 set +e
 "$FLAGPILOT_BIN" run \
   --feature checkout_v2 \
@@ -76,17 +76,18 @@ set +e
   --spike-rate 0.25 \
   --spike-threshold-pct 25 \
   --seed 42 \
-  --interval 0
+  --interval 0 \
+  --rollback-to-zero
 RUN_EXIT=$?
 set -e
 echo "Run exited with code $RUN_EXIT"
 
 echo ""
-echo "=== [4/5] ROLLBACK TO 0% (HUMAN ACTION: type APPROVE when prompted) ==="
+echo "=== [4/5] CONFIRM CLEAN 0% RESET & HEALTHY STATUS (HUMAN ACTION: type APPROVE when prompted) ==="
 "$FLAGPILOT_BIN" rollback \
   --feature checkout_v2 \
   --env Development \
-  --old-percentage 10 \
+  --old-percentage 0 \
   --reason "demo cleanup"
 
 echo ""

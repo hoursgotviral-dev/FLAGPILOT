@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
-from collections.abc import Sequence
+import sys
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from flagpilot.types import BreachAction, Plan, Step
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_STAGES: tuple[int, ...] = (1, 10, 50, 100)
 
@@ -176,6 +183,180 @@ def parse_plain_english_request(
         description=f"Parsed from request: {text}",
         source_request=text,
     )
+
+
+def _strip_json_fences(raw_text: str) -> str:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def is_llm_configured() -> bool:
+    """Return True only when FLAGPILOT_LLM_PROVIDER and its matching API key are set."""
+    provider = os.environ.get("FLAGPILOT_LLM_PROVIDER", "").strip().lower()
+    if provider == "gemini":
+        return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    if provider == "openai":
+        return bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    return False
+
+
+def plan_with_llm(
+    prompt: str,
+    *,
+    min_samples: int = 20,
+    project_id: int | None = None,
+    segment_name: str | None = None,
+    provider: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    timeout_seconds: float = 15.0,
+    opener: Callable[..., Any] | None = None,
+) -> Plan:
+    """Optional thin LLM planner adapter targeting ``plan_from_dict`` with deterministic fallback.
+
+    Off by default; uses standard-library HTTP (Gemini or OpenAI REST APIs) to request
+    strict JSON conforming to ``Plan``, validates through ``plan_from_dict()``, and falls
+    back gracefully to ``parse_plain_english_request()`` on missing keys, network errors,
+    or invalid/malformed LLM JSON.
+    """
+    clean_prompt = prompt.strip()
+    resolved_provider = (provider or os.environ.get("FLAGPILOT_LLM_PROVIDER", "")).strip().lower()
+    if not resolved_provider:
+        if os.environ.get("GEMINI_API_KEY", "").strip():
+            resolved_provider = "gemini"
+        elif os.environ.get("OPENAI_API_KEY", "").strip():
+            resolved_provider = "openai"
+
+    if resolved_provider == "gemini":
+        resolved_key = (api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+    elif resolved_provider == "openai":
+        resolved_key = (api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
+    else:
+        resolved_key = ""
+
+    def _fallback(reason: str) -> Plan:
+        cleaned_reason = reason.replace(resolved_key, "[REDACTED]") if resolved_key else reason
+        logger.warning(
+            "LLM planner fallback (%s); using deterministic parser.",
+            cleaned_reason,
+        )
+        return parse_plain_english_request(
+            prompt,
+            min_samples=min_samples,
+            project_id=project_id,
+            segment_name=segment_name,
+        )
+
+    if not clean_prompt:
+        return _fallback("empty prompt")
+    if resolved_provider not in ("gemini", "openai") or not resolved_key:
+        return _fallback("no supported FLAGPILOT_LLM_PROVIDER and API key configured")
+
+    system_instruction = (
+        "Return ONLY a single JSON object (no prose or markdown) matching this exact Plan schema:\n"
+        "{\n"
+        '  "feature_name": "string",\n'
+        '  "environment": "string",\n'
+        '  "steps": [{"percentage": 1, "min_samples": 20, "max_error_rate": 0.02}],\n'
+        '  "rollback_percentage": 0,\n'
+        '  "on_breach": "rollback" | "pause",\n'
+        '  "segment_name": "optional string",\n'
+        '  "project_id": null\n'
+        "}\n"
+        "Percentages in steps must be integers in 1..100 and strictly increasing. "
+        "max_error_rate is a decimal fraction in 0.0..1.0 (e.g. 2% -> 0.02)."
+    )
+
+    if resolved_provider == "gemini":
+        resolved_model = (
+            model or os.environ.get("FLAGPILOT_LLM_MODEL", "gemini-2.5-flash")
+        ).strip()
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{resolved_model}:generateContent"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": resolved_key,
+        }
+        body: dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "contents": [{"role": "user", "parts": [{"text": clean_prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "responseMimeType": "application/json",
+            },
+        }
+    else:
+        resolved_model = (model or os.environ.get("FLAGPILOT_LLM_MODEL", "gpt-4o-mini")).strip()
+        base = os.environ.get("FLAGPILOT_OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        url = f"{base}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {resolved_key}",
+        }
+        body = {
+            "model": resolved_model,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": clean_prompt},
+            ],
+        }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    open_fn = opener if opener is not None else urllib.request.urlopen
+
+    try:
+        with open_fn(req, timeout=timeout_seconds) as resp:
+            raw_http = resp.read()
+        envelope = json.loads(
+            raw_http.decode("utf-8") if isinstance(raw_http, bytes) else str(raw_http)
+        )
+        if resolved_provider == "gemini":
+            content_text = envelope["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            content_text = envelope["choices"][0]["message"]["content"]
+        parsed_payload = json.loads(_strip_json_fences(str(content_text)))
+        if not isinstance(parsed_payload, dict):
+            raise PlanValidationError("LLM response must decode to a JSON object.")
+
+        if project_id is not None:
+            parsed_payload["project_id"] = project_id
+        if segment_name:
+            parsed_payload["segment_name"] = segment_name
+        parsed_payload.setdefault("source_request", clean_prompt)
+        if isinstance(parsed_payload.get("steps"), list):
+            for step_item in parsed_payload["steps"]:
+                if isinstance(step_item, dict):
+                    step_item.setdefault("min_samples", min_samples)
+
+        return plan_from_dict(parsed_payload)
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        OSError,
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return _fallback(f"{type(exc).__name__}: {exc}")
 
 
 def build_plan(
@@ -476,3 +657,90 @@ def load_plan(path: Path) -> Plan:
     """Load and validate a Plan from a JSON file."""
     raw = json.loads(path.read_text(encoding="utf-8"))
     return plan_from_dict(raw)
+
+
+def _supports_unicode(stream: TextIO) -> bool:
+    encoding = (getattr(stream, "encoding", None) or "utf-8").lower()
+    return "utf" in encoding
+
+
+def format_plan_summary_plain(plan: Plan) -> str:
+    """Format a deterministic plain-text summary of a rollout plan."""
+    progression = "0% -> " + " -> ".join(f"{step.percentage}%" for step in plan.steps)
+    threshold = plan.steps[0].max_error_rate
+    min_samples = plan.steps[0].min_samples
+    segment = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
+    calls = planned_api_calls(plan)
+    lines = [
+        f"FlagPilot Rollout Plan: {plan.feature_name}",
+        f"Environment: {plan.environment}",
+        f"Segment: {segment} (PERCENTAGE_SPLIT)",
+        f"Stage Progression: {progression}",
+        f"Safety Threshold: max_error_rate <= {threshold:.2%} (min_samples={min_samples}, on_breach={plan.on_breach} -> {plan.rollback_percentage}%)",
+        "Planned Flagsmith API Calls:",
+    ]
+    for idx, call in enumerate(calls, start=1):
+        lines.append(f"  {idx}. {call}")
+    return "\n".join(lines) + "\n"
+
+
+def render_plan_summary(
+    plan: Plan,
+    *,
+    plain: bool = False,
+    output_stream: TextIO | None = None,
+) -> None:
+    """Render a bordered Rich summary panel for ``flagpilot plan`` (or plain fallback)."""
+    out = output_stream if output_stream is not None else sys.stdout
+    if plain:
+        out.write(format_plan_summary_plain(plan))
+        out.flush()
+        return
+
+    try:
+        from rich.console import Console, Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+    except ImportError:
+        out.write(format_plan_summary_plain(plan))
+        out.flush()
+        return
+
+    arrow = "→" if _supports_unicode(out) else "->"
+    progression = f"0% {arrow} " + f" {arrow} ".join(f"{step.percentage}%" for step in plan.steps)
+    threshold = plan.steps[0].max_error_rate
+    min_samples = plan.steps[0].min_samples
+    segment = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
+    is_tty = bool(getattr(out, "isatty", lambda: False)())
+
+    meta_table = Table.grid(padding=(0, 2))
+    meta_table.add_column(style="bold cyan", no_wrap=True)
+    meta_table.add_column()
+    meta_table.add_row("Target Flag", plan.feature_name)
+    meta_table.add_row("Environment", plan.environment)
+    meta_table.add_row("Segment", f"{segment} (PERCENTAGE_SPLIT)")
+    meta_table.add_row("Stage Progression", progression)
+    meta_table.add_row(
+        "Safety Threshold",
+        f"error_rate <= {threshold:.2%} (min_samples={min_samples}, on_breach={plan.on_breach} {arrow} {plan.rollback_percentage}%)",
+    )
+
+    calls = planned_api_calls(plan)
+    calls_header = Text("Planned Flagsmith API Calls (dry plan — zero calls sent):", style="bold")
+    calls_lines = [Text(f"  {idx}. {call}", style="dim") for idx, call in enumerate(calls, start=1)]
+
+    panel = Panel(
+        Group(meta_table, Text(""), calls_header, *calls_lines),
+        title="FlagPilot Rollout Plan",
+        border_style="cyan",
+        padding=(1, 2),
+    )
+    console = Console(
+        file=out,
+        no_color=not is_tty,
+        safe_box=True,
+        highlight=False,
+        width=None if is_tty else 120,
+    )
+    console.print(panel)
