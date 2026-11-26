@@ -13,7 +13,7 @@
    docker compose up -d
    ```
 
-2. Run FlagPilot's idempotent bootstrapper (polls `http://localhost:8000/health/liveness/`, checks `GET /version/`, creates the initial superuser or logs in, creates/reuses organisation/project/environment, mints or preserves the Master API key and server SDK key, creates the `checkout_v2` demo feature with global default `false` and a `0%` `PERCENTAGE_SPLIT` segment override, and writes local `.env` without printing secrets):
+2. Run FlagPilot's idempotent bootstrapper (polls `http://localhost:8000/health/liveness/`, checks `GET /version/`, creates the initial superuser or logs in, creates/reuses organisation/project/environment, mints or preserves the Master API key and server SDK key, creates the `checkout_v2` demo feature with global default `false` and a `0%` `PERCENTAGE_SPLIT` segment override, idempotently retrieves/creates a `"Grafana"` Feature Health provider webhook, and writes local `.env` without printing secrets):
 
    - **macOS / Linux**: `.venv/bin/flagpilot bootstrap` (or `make up && make bootstrap`)
    - **Windows PowerShell**: `.venv\Scripts\flagpilot.exe bootstrap` (or `.\tasks.ps1 up; .\tasks.ps1 bootstrap`)
@@ -33,9 +33,10 @@ FLAGSMITH_ENVIRONMENT_KEY=<environment-client-key>
 FLAGSMITH_PROJECT_ID=<project-id>
 FLAGSMITH_FEATURE_ID=<feature-id>
 FLAGSMITH_SEGMENT_ID=<segment-id>
+FLAGSMITH_HEALTH_WEBHOOK_URL=<grafana-feature-health-webhook-url>
 ```
 
-Never commit `.env` or print keys into terminal logs or reports.
+`FLAGSMITH_HEALTH_WEBHOOK_URL` is optional at runtime: when present, FlagPilot posts Alertmanager-format JSON (`status: "firing"` on error-rate rollback so Flagsmith marks the feature `Unhealthy`, and `status: "resolved"` on clean completion or manual reset); if unset or unreachable, FlagPilot logs a warning and still completes the rollback safely. Never commit `.env` or print keys or webhook URLs into terminal logs or reports.
 
 ## Running FlagPilot
 
