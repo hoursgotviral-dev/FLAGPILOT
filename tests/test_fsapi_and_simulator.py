@@ -118,12 +118,18 @@ def test_config_from_env_and_secret_repr(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("FLAGSMITH_ADMIN_KEY", "super-secret-admin-key")
     monkeypatch.setenv("FLAGSMITH_SERVER_KEY", "ser.secret-env-key")
     monkeypatch.setenv("FLAGSMITH_PROJECT_ID", "12")
+    monkeypatch.setenv(
+        "FLAGSMITH_HEALTH_WEBHOOK_URL",
+        "http://localhost:8000/api/v1/feature-health/secret-webhook-token/",
+    )
 
     cfg = FlagsmithConfig.from_env()
     assert cfg.api_url == "http://localhost:8000"
     assert cfg.project_id == 12
+    assert cfg.health_webhook_url == "http://localhost:8000/api/v1/feature-health/secret-webhook-token/"
     assert "super-secret-admin-key" not in repr(cfg)
     assert "ser.secret-env-key" not in repr(cfg)
+    assert "secret-webhook-token" not in repr(cfg)
 
     monkeypatch.delenv("FLAGSMITH_ADMIN_KEY")
     with pytest.raises(ValueError, match="FLAGSMITH_ADMIN_KEY"):
@@ -387,3 +393,116 @@ def test_simulator_sdk_evaluator_uses_persistent_identity() -> None:
 
     with pytest.raises(ValueError):
         evaluator.evaluate("", "checkout_v2")
+
+
+def test_notify_health_builds_alertmanager_payload_and_is_failsafe(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """notify_health sends Grafana/Alertmanager JSON, warns when unset/unreachable, never raises."""
+    monkeypatch.delenv("FLAGSMITH_HEALTH_WEBHOOK_URL", raising=False)
+
+    # Unset URL logs warning and returns False cleanly
+    session_unset = MagicMock()
+    session_unset.headers = {}
+    client_unset = FlagsmithManagementClient(
+        FlagsmithConfig(api_url="http://localhost:8000", admin_key="tok", project_id=1),
+        session=session_unset,
+    )
+    with caplog.at_level("WARNING"):
+        assert (
+            client_unset.notify_health(
+                "checkout_v2",
+                "Development",
+                status="firing",
+                summary="spike",
+                description="error_rate=0.2000 > max=0.0200",
+            )
+            is False
+        )
+    assert "FLAGSMITH_HEALTH_WEBHOOK_URL is not configured" in caplog.text
+    session_unset.request.assert_not_called()
+
+    # Configured URL posts firing and resolved payloads
+    webhook = "http://localhost:8000/api/v1/feature-health/hook-secret-123/"
+    session = MagicMock()
+    session.headers = {}
+    session.request.return_value = _mock_response({"status": "ok"}, 200)
+    client = FlagsmithManagementClient(
+        FlagsmithConfig(
+            api_url="http://localhost:8000",
+            admin_key="tok",
+            project_id=1,
+            health_webhook_url=webhook,
+        ),
+        session=session,
+    )
+
+    assert (
+        client.notify_health(
+            "checkout_v2",
+            "Development",
+            status="firing",
+            summary="Rollback at 50%",
+            description="Error rate 20.0% exceeded threshold 2.0%",
+        )
+        is True
+    )
+    call_firing = session.request.call_args.kwargs
+    assert call_firing["method"] == "POST"
+    assert call_firing["url"] == webhook
+    firing_json = call_firing["json"]
+    assert firing_json["status"] == "firing"
+    alert = firing_json["alerts"][0]
+    assert alert["labels"]["flagsmith_feature"] == "checkout_v2"
+    assert alert["labels"]["flagsmith_environment"] == "Development"
+    assert alert["annotations"]["summary"] == "Rollback at 50%"
+    assert "20.0%" in alert["annotations"]["description"]
+    assert alert["endsAt"] == "0001-01-01T00:00:00Z"
+
+    assert (
+        client.notify_health(
+            "checkout_v2",
+            "Development",
+            status="resolved",
+            summary="Rollout clean",
+            description="Completed 4 stages",
+        )
+        is True
+    )
+    resolved_json = session.request.call_args.kwargs["json"]
+    assert resolved_json["status"] == "resolved"
+    assert resolved_json["alerts"][0]["endsAt"] != "0001-01-01T00:00:00Z"
+
+    # Unreachable webhook or non-2xx never raises and scrubs secret webhook URL
+    caplog.clear()
+    session.request.return_value = _mock_response(None, 502, text=f"bad gateway for {webhook}")
+    with caplog.at_level("WARNING"):
+        assert (
+            client.notify_health(
+                "checkout_v2",
+                "Development",
+                status="firing",
+                summary="s",
+                description="d",
+            )
+            is False
+        )
+    assert "HTTP 502" in caplog.text
+    assert "hook-secret-123" not in caplog.text
+
+    caplog.clear()
+    session.request.side_effect = requests.ConnectionError(f"failed reaching {webhook}")
+    with caplog.at_level("WARNING"):
+        assert (
+            client.notify_health(
+                "checkout_v2",
+                "Development",
+                status="firing",
+                summary="s",
+                description="d",
+            )
+            is False
+        )
+    assert "unreachable" in caplog.text
+    assert "hook-secret-123" not in caplog.text

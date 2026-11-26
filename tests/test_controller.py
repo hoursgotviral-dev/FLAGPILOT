@@ -314,3 +314,121 @@ def test_cli_run_and_rollback_subcommands_with_fake_client(
     assert "secret-admin-key-not-logged" not in audit_text
     assert "post-demo reset" in audit_text
     assert "SYNTHETIC DATA" in report_out.read_text(encoding="utf-8")
+
+
+class _RecordingHealthNotifier:
+    def __init__(self, *, should_raise: bool = False) -> None:
+        self.calls: list[dict[str, str]] = []
+        self.should_raise = should_raise
+
+    def notify_health(
+        self,
+        feature_name: str,
+        environment: str,
+        *,
+        status: str,
+        summary: str,
+        description: str,
+    ) -> bool:
+        self.calls.append(
+            {
+                "feature_name": feature_name,
+                "environment": environment,
+                "status": status,
+                "summary": summary,
+                "description": description,
+            }
+        )
+        if self.should_raise:
+            raise RuntimeError("webhook exploded")
+        return True
+
+
+def test_controller_and_manual_rollback_emit_health_notifications(tmp_path: Path) -> None:
+    """Rollback emits 'firing' (fail-safe); clean completion and manual reset emit 'resolved'."""
+    # 1. Error-rate spike rollback -> 'firing' (and raising notifier does not abort rollback)
+    client_fail = _FakeFlagsmithClient()
+    eval_fail = OfflineFakeEvaluator()
+    sim_fail = TrafficSimulator(
+        eval_fail,
+        user_count=200,
+        seed=42,
+        baseline_rate=0.005,
+        error_rate_fn=make_error_rate_fn(
+            baseline_rate=0.005,
+            spike_rate=0.25,
+            spike_threshold_pct=25.0,
+        ),
+    )
+    firing_notifier = _RecordingHealthNotifier(should_raise=True)
+    writer_fail = ApprovedFlagsmithWriter(
+        client_fail,
+        input_stream=io.StringIO("APPROVE\n" * 4),
+        output_stream=io.StringIO(),
+        is_tty=True,
+    )
+    ctrl_fail = RolloutController(
+        writer_fail,
+        _SimulatorSignalProvider(eval_fail, sim_fail),
+        interval_seconds=0.0,
+        audit_log_path=tmp_path / "audit1.log",
+        output_stream=io.StringIO(),
+        rollback_to_zero=True,
+        health_notifier=firing_notifier,
+    )
+    res_fail = ctrl_fail.run(build_plan("checkout_v2", "Development"))
+    assert res_fail.final_status == "rolled_back"
+    assert res_fail.rollback_to_percentage == 0
+    assert len(firing_notifier.calls) == 1
+    assert firing_notifier.calls[0]["status"] == "firing"
+    assert firing_notifier.calls[0]["feature_name"] == "checkout_v2"
+    assert firing_notifier.calls[0]["environment"] == "Development"
+    assert "2.00%" in firing_notifier.calls[0]["description"]
+
+    # 2. Clean rollout completion -> 'resolved'
+    client_ok = _FakeFlagsmithClient()
+    eval_ok = OfflineFakeEvaluator()
+    sim_ok = TrafficSimulator(
+        eval_ok,
+        user_count=200,
+        seed=42,
+        baseline_rate=0.005,
+        error_rate_fn=make_error_rate_fn(baseline_rate=0.005),
+    )
+    resolved_notifier = _RecordingHealthNotifier()
+    writer_ok = ApprovedFlagsmithWriter(
+        client_ok,
+        input_stream=io.StringIO("APPROVE\n" * 4),
+        output_stream=io.StringIO(),
+        is_tty=True,
+    )
+    ctrl_ok = RolloutController(
+        writer_ok,
+        _SimulatorSignalProvider(eval_ok, sim_ok),
+        interval_seconds=0.0,
+        audit_log_path=tmp_path / "audit2.log",
+        output_stream=io.StringIO(),
+        health_notifier=resolved_notifier,
+    )
+    res_ok = ctrl_ok.run(build_plan("checkout_v2", "Development"))
+    assert res_ok.final_status == "completed"
+    assert [c["status"] for c in resolved_notifier.calls] == ["resolved"]
+
+    # 3. Manual rollback/reset -> 'resolved'
+    manual_notifier = _RecordingHealthNotifier()
+    writer_manual = ApprovedFlagsmithWriter(
+        client_ok,
+        input_stream=io.StringIO("APPROVE\n"),
+        output_stream=io.StringIO(),
+        is_tty=True,
+    )
+    execute_manual_rollback(
+        writer_manual,
+        build_plan("checkout_v2", "Development"),
+        old_percentage=100,
+        reason="manual reset",
+        audit_log_path=tmp_path / "audit3.log",
+        output_stream=io.StringIO(),
+        health_notifier=manual_notifier,
+    )
+    assert [c["status"] for c in manual_notifier.calls] == ["resolved"]
