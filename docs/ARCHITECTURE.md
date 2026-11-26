@@ -20,12 +20,12 @@ FlagPilot is a deterministic terminal controller for staged feature flag rollout
 
 1. `flagpilot plan "<request>"` parses the request offline into `plan.json` and `plan.md`.
 2. `flagpilot apply plan.json` prints the plan, prompts for exact `APPROVE`, and writes the target percentage through `FlagsmithManagementClient`.
-3. `flagpilot run` loops over `plan.steps`:
-   - Requests `APPROVE` via `apply.py` before writing the stage percentage.
+3. `flagpilot run` prompts for exact `APPROVE` upfront on the full rollout schedule and error-rate safety policy (unless `--step-approve` is passed for per-stage prompts), then loops over `plan.steps`:
+   - Writes the stage percentage through `ApprovedFlagsmithWriter` (requiring `--step-approve` confirmation only when opted in).
    - Waits `interval_seconds`.
-   - Runs `TrafficSimulator` over persistent `user_000..` identities.
+   - Runs `TrafficSimulator` over persistent `user_000..` identities and records `retained_from_previous_stage` monotonicity checks.
    - Logs the decision (`advance`, `hold`, `rollback`, or `complete`) to `audit.log`.
-   - On threshold breach, prints the reason and requests `APPROVE` to roll back to the previous safe percentage (or `0%`).
+   - On threshold breach, automatically rolls back to `0%` (with `--rollback-to-zero`, default in demo scripts) or the previous safe percentage without pausing mid-incident, runs a post-rollback verification tick confirming `0/200` exposure, and fires the Feature Health webhook.
 4. `flagpilot report` reads `audit.log` and `reports/last_run.json` and writes `reports/rollout.html`.
 
 ## Approval Gate
