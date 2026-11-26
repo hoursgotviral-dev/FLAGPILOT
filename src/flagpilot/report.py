@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +221,20 @@ def load_audit_log(path: Path) -> list[dict[str, Any]]:
         if isinstance(parsed, dict):
             entries.append(parsed)
     return entries
+
+
+def _format_utc_timestamp(raw_ts: str) -> str:
+    """Format an ISO-8601 UTC timestamp cleanly on one line (YYYY-MM-DD HH:MM:SS UTC)."""
+    cleaned = raw_ts.strip()
+    if not cleaned or cleaned == "—":
+        return "—"
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(UTC)
+        return parsed.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except ValueError:
+        return cleaned
 
 
 def _match_audit_times(
@@ -463,7 +478,7 @@ def render_html_report(
             f"<td>{ret_cell}</td>"
             f'<td><span class="badge {badge_cls}">{html.escape(d.action)}</span> '
             f'<span class="muted">{html.escape(d.reason)}</span></td>'
-            f'<td class="mono">{html.escape(timestamp)}</td>'
+            f'<td class="mono">{html.escape(_format_utc_timestamp(timestamp))}</td>'
             "</tr>"
         )
 
@@ -491,7 +506,7 @@ def render_html_report(
             action_cell = f'<span class="badge {v_badge}">verified 0%</span>'
         audit_rows.append(
             "<tr>"
-            f'<td class="mono">{html.escape(str(entry.get("timestamp", "")))}</td>'
+            f'<td class="mono">{html.escape(_format_utc_timestamp(str(entry.get("timestamp", ""))))}</td>'
             f"<td>{action_cell}</td>"
             f"<td>{html.escape(change_text)}</td>"
             f"<td>{html.escape(str(entry.get('reason', '')))}</td>"
@@ -702,7 +717,7 @@ def render_html_report(
     }}
     .summary-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(3, 1fr);
       gap: 0.75rem;
     }}
     .kv {{ padding: 0.65rem 0.75rem; border: 1px solid var(--border); border-radius: 8px; }}
@@ -712,7 +727,7 @@ def render_html_report(
     table {{ width: 100%; border-collapse: collapse; font-size: 0.92rem; }}
     th, td {{ text-align: left; padding: 0.65rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; }}
     th {{ color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; white-space: nowrap; }}
     .muted {{ color: var(--muted); font-size: 0.85rem; }}
     .badge {{
       display: inline-block;

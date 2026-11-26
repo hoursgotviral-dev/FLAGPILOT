@@ -112,7 +112,9 @@ def test_report_subcommand_generates_static_html_from_fake_run_and_audit_log(
     assert "100 / 200 (50.0%)" in html_doc
     assert "<svg " in html_doc
     assert "<polyline" in html_doc
-    assert "+00:00" in html_doc
+    assert " UTC" in html_doc
+    assert "repeat(3, 1fr)" in html_doc
+    assert "white-space: nowrap" in html_doc
     assert "Feature Health" in html_doc
 
 
