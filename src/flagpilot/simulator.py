@@ -1,7 +1,7 @@
 """SYNTHETIC DATA traffic simulator using stable persistent identities.
 
-All Flagsmith Python SDK calls live exclusively in this module and are marked
-``UNVERIFIED: check against local instance``.
+Flagsmith Python SDK calls live exclusively in this module (verified against
+local self-hosted Flagsmith 2.295.2).
 """
 
 from __future__ import annotations
@@ -104,7 +104,13 @@ class FlagsmithSDKEvaluator:
     evaluation call; environment-only requests cannot trigger percentage splits.
     """
 
-    def __init__(self, environment_key: str, api_url: str) -> None:
+    def __init__(
+        self,
+        environment_key: str,
+        api_url: str,
+        *,
+        enable_local_evaluation: bool = False,
+    ) -> None:
         if not environment_key:
             raise ValueError("environment_key is required for Flagsmith SDK evaluation.")
         if not api_url:
@@ -115,11 +121,18 @@ class FlagsmithSDKEvaluator:
         else:
             normalized_url = f"{normalized_url}/"
 
-        # UNVERIFIED: check against local instance
-        self._client = Flagsmith(
-            environment_key=environment_key,
-            api_url=normalized_url,
-        )
+        self._enable_local_evaluation = enable_local_evaluation
+        if enable_local_evaluation:
+            self._client = Flagsmith(
+                environment_key=environment_key,
+                api_url=normalized_url,
+                enable_local_evaluation=True,
+            )
+        else:
+            self._client = Flagsmith(
+                environment_key=environment_key,
+                api_url=normalized_url,
+            )
 
     @classmethod
     def from_env(cls) -> FlagsmithSDKEvaluator:
@@ -130,17 +143,27 @@ class FlagsmithSDKEvaluator:
             os.environ.get("FLAGSMITH_SERVER_KEY", "").strip()
             or os.environ.get("FLAGSMITH_CLIENT_KEY", "").strip()
         )
-        return cls(environment_key=env_key, api_url=api_url)
+        return cls(
+            environment_key=env_key,
+            api_url=api_url,
+            enable_local_evaluation=env_key.startswith("ser."),
+        )
+
+    def refresh(self) -> None:
+        """Refresh the cached environment document when local evaluation is enabled."""
+        if self._enable_local_evaluation:
+            self._client.update_environment()
+
+    def close(self) -> None:
+        """Stop any background polling threads started by the Flagsmith SDK."""
+        self._client.close()
 
     def evaluate(self, identifier: str, feature_name: str) -> FlagEvaluation:
         """Evaluate ``feature_name`` for a stable persistent ``identifier``."""
         if not identifier:
             raise ValueError("Persistent identity identifier must not be empty.")
-        # UNVERIFIED: check against local instance
         flags = self._client.get_identity_flags(identifier=identifier)
-        # UNVERIFIED: check against local instance
         enabled = bool(flags.is_feature_enabled(feature_name))
-        # UNVERIFIED: check against local instance
         value = flags.get_feature_value(feature_name)
         return FlagEvaluation(
             identifier=identifier,
@@ -290,6 +313,9 @@ class TrafficSimulator:
 
     def run_round(self, feature_name: str) -> SimulationRoundResult:
         """Evaluate ``feature_name`` for every persistent identity and simulate errors."""
+        refresh = getattr(self._evaluator, "refresh", None)
+        if callable(refresh):
+            refresh()
         self._round_number += 1
         exposed: list[str] = []
         unexposed: list[str] = []

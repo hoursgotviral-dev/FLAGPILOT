@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from flagpilot.bootstrap import BootstrapError, BootstrapResult
 from flagpilot.cli import SUBCOMMANDS, main
 from flagpilot.planner import build_plan, save_plan
 from flagpilot.report import save_run_result
@@ -201,3 +202,32 @@ def test_cli_apply_requires_exact_approve_and_cancels_otherwise(
     out = capsys.readouterr().out
     assert "# FlagPilot Rollout Plan: `checkout_v2`" in out
     assert "Applied 10% to checkout_v2 (Development)." in out
+
+
+def test_cli_bootstrap_subcommand(tmp_path: Path) -> None:
+    """bootstrap subcommand invokes bootstrap_flagsmith with parsed arguments."""
+    env_file = tmp_path / ".env"
+    fake_result = BootstrapResult(
+        api_url="http://localhost:8000",
+        has_users_before=False,
+        org_id=1,
+        project_id=2,
+        environment_id=3,
+        feature_id=4,
+        segment_id=5,
+        preserved_master_key=False,
+        preserved_server_key=False,
+        env_path=env_file,
+    )
+    with patch("flagpilot.cli.bootstrap_flagsmith", return_value=fake_result) as mock_boot:
+        code = main(["bootstrap", "--base-url", "http://localhost:8000", "--env-file", str(env_file)])
+
+    assert code == 0
+    mock_boot.assert_called_once()
+    passed_cfg = mock_boot.call_args.args[0]
+    assert passed_cfg.base_url == "http://localhost:8000"
+    assert passed_cfg.env_path == env_file
+
+    with patch("flagpilot.cli.bootstrap_flagsmith", side_effect=BootstrapError("boom")):
+        err_code = main(["bootstrap", "--env-file", str(env_file)])
+    assert err_code == 1

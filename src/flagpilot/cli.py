@@ -10,6 +10,17 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from flagpilot.apply import ApprovalDeniedError, ApprovedFlagsmithWriter
+from flagpilot.bootstrap import (
+    DEFAULT_BASE_URL,
+    DEFAULT_ENV_NAME,
+    DEFAULT_FEATURE_NAME,
+    DEFAULT_ORG_NAME,
+    DEFAULT_PROJECT_NAME,
+    DEFAULT_SEGMENT_NAME,
+    BootstrapConfig,
+    BootstrapError,
+    bootstrap_flagsmith,
+)
 from flagpilot.controller import RolloutController, execute_manual_rollback
 from flagpilot.fsapi import FlagsmithAPIError, FlagsmithConfig, FlagsmithManagementClient
 from flagpilot.planner import (
@@ -37,7 +48,7 @@ from flagpilot.simulator import (
 )
 from flagpilot.types import FlagEvaluator, Plan, StageMetrics, Step
 
-SUBCOMMANDS = ("plan", "apply", "run", "rollback", "report")
+SUBCOMMANDS = ("bootstrap", "plan", "apply", "run", "rollback", "report")
 DEFAULT_MAX_ERROR_RATE = 0.02
 
 
@@ -101,6 +112,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Staged feature flag rollout controller for self-hosted Flagsmith.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap", help="Bootstrap local self-hosted Flagsmith and write .env"
+    )
+    bootstrap_parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    bootstrap_parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    bootstrap_parser.add_argument("--org-name", default=DEFAULT_ORG_NAME)
+    bootstrap_parser.add_argument("--project-name", default=DEFAULT_PROJECT_NAME)
+    bootstrap_parser.add_argument("--env-name", default=DEFAULT_ENV_NAME)
+    bootstrap_parser.add_argument("--feature-name", default=DEFAULT_FEATURE_NAME)
+    bootstrap_parser.add_argument("--segment-name", default=DEFAULT_SEGMENT_NAME)
 
     plan_parser = subparsers.add_parser("plan", help="Generate a deterministic rollout plan")
     plan_parser.add_argument(
@@ -167,6 +189,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("reports/rollout.html"),
         help="Path to save the HTML rollout report (default: reports/rollout.html)",
     )
+    run_parser.add_argument(
+        "--rollback-to-zero",
+        action="store_true",
+        help="Roll back directly to 0%% on threshold breach instead of previous safe stage",
+    )
     run_parser.add_argument("--audit-log", type=Path, default=Path("audit.log"))
 
     rollback_parser = subparsers.add_parser(
@@ -200,6 +227,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def _handle_bootstrap(args: argparse.Namespace) -> int:
+    cfg = BootstrapConfig(
+        base_url=args.base_url,
+        env_path=args.env_file,
+        org_name=args.org_name,
+        project_name=args.project_name,
+        env_name=args.env_name,
+        feature_name=args.feature_name,
+        segment_name=args.segment_name,
+    )
+    bootstrap_flagsmith(cfg)
+    return 0
 
 
 def _handle_plan(args: argparse.Namespace) -> int:
@@ -272,8 +313,14 @@ def _handle_run(args: argparse.Namespace) -> int:
         signal_provider=provider,
         interval_seconds=args.interval,
         audit_log_path=args.audit_log,
+        rollback_to_zero=args.rollback_to_zero,
     )
-    result = controller.run(plan, is_synthetic=True)
+    try:
+        result = controller.run(plan, is_synthetic=True)
+    finally:
+        close_fn = getattr(evaluator, "close", None)
+        if callable(close_fn):
+            close_fn()
 
     print(f"[{SYNTHETIC_LABEL}] Rollout finished with status: {result.final_status}")
     save_run_result(result, args.run_out)
@@ -311,6 +358,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     handlers = {
+        "bootstrap": _handle_bootstrap,
         "plan": _handle_plan,
         "apply": _handle_apply,
         "run": _handle_run,
@@ -319,7 +367,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     try:
         return handlers[args.command](args)
-    except (ApprovalDeniedError, FlagsmithAPIError, PlanValidationError, ValueError) as exc:
+    except (
+        ApprovalDeniedError,
+        BootstrapError,
+        FlagsmithAPIError,
+        PlanValidationError,
+        ValueError,
+    ) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

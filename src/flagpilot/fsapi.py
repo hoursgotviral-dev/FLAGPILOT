@@ -1,8 +1,6 @@
 """Flagsmith REST Management API client.
 
-All Flagsmith HTTP calls live exclusively in this module and are marked
-``UNVERIFIED: check against local instance`` until verified against a running
-self-hosted Flagsmith server.
+Endpoints verified against local self-hosted Flagsmith 2.295.2.
 """
 
 from __future__ import annotations
@@ -94,8 +92,10 @@ class FlagsmithConfig:
 class FlagsmithManagementClient:
     """REST Management API client implementing FlagsmithClient and RolloutBackend.
 
-    Uses Flagsmith Management API tokens (``Authorization: Api-Key <token>``)
-    and ``PERCENTAGE_SPLIT`` segment rules per Flagsmith documentation.
+    Uses Flagsmith Management API tokens (``Authorization: Api-Key <token>``),
+    DRF trailing slashes, ``PERCENTAGE_SPLIT`` segment rules, and the unified
+    ``/api/__future__/environments/{env_key}/features/{feature_id}/`` endpoint
+    that works across both Feature Versioning v1 and v2 environments.
     """
 
     def __init__(
@@ -104,7 +104,8 @@ class FlagsmithManagementClient:
         session: requests.Session | None = None,
     ) -> None:
         self._config = config
-        self._base_url = self._normalize_api_v1_url(config.api_url)
+        self._root_url = self._normalize_root_url(config.api_url)
+        self._base_url = f"{self._root_url}api/v1/"
         self._timeout = config.timeout_seconds
         self._secrets: tuple[str, ...] = tuple(
             s for s in (config.admin_key, config.environment_key or "") if s
@@ -124,11 +125,13 @@ class FlagsmithManagementClient:
         return cls(FlagsmithConfig.from_env(), session=session)
 
     @staticmethod
-    def _normalize_api_v1_url(api_url: str) -> str:
-        clean = api_url.rstrip("/")
-        if clean.endswith("/api/v1"):
-            return f"{clean}/"
-        return f"{clean}/api/v1/"
+    def _normalize_root_url(api_url: str) -> str:
+        clean = api_url.rstrip("/").removesuffix("/api/v1")
+        return f"{clean}/"
+
+    @staticmethod
+    def _ensure_trailing_slash(path: str) -> str:
+        return path if path.endswith("/") else f"{path}/"
 
     def _request(
         self,
@@ -138,9 +141,13 @@ class FlagsmithManagementClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
-        url = f"{self._base_url}{path.lstrip('/')}"
+        normalized_path = self._ensure_trailing_slash(path.lstrip("/"))
+        if normalized_path.startswith("api/"):
+            url = f"{self._root_url}{normalized_path}"
+        else:
+            url = f"{self._base_url}{normalized_path}"
+
         try:
-            # UNVERIFIED: check against local instance
             response = self._session.request(
                 method=method,
                 url=url,
@@ -151,13 +158,13 @@ class FlagsmithManagementClient:
         except requests.RequestException as exc:
             safe_exc = _sanitize_secrets(str(exc), self._secrets)
             raise FlagsmithAPIError(
-                f"Flagsmith Management API {method} {path} request error: {safe_exc}"
+                f"Flagsmith Management API {method} {normalized_path} request error: {safe_exc}"
             ) from None
 
         if not response.ok:
             safe_body = _sanitize_secrets(response.text or "", self._secrets)
             raise FlagsmithAPIError(
-                f"Flagsmith Management API {method} {path} failed "
+                f"Flagsmith Management API {method} {normalized_path} failed "
                 f"(HTTP {response.status_code}): {safe_body}",
                 status_code=response.status_code,
                 response_body=safe_body,
@@ -197,7 +204,6 @@ class FlagsmithManagementClient:
             return project_id
         if self._config.project_id is not None:
             return self._config.project_id
-        # UNVERIFIED: check against local instance
         payload = self._request("GET", "projects/")
         projects = self._extract_results(payload)
         if not projects:
@@ -211,7 +217,6 @@ class FlagsmithManagementClient:
     ) -> tuple[int, str]:
         """Resolve environment numeric ID and API key from name/key or config."""
         target = environment or self._config.environment_key
-        # UNVERIFIED: check against local instance
         payload = self._request("GET", "environments/", params={"project": project_id})
         environments = self._extract_results(payload)
         if not environments:
@@ -226,8 +231,12 @@ class FlagsmithManagementClient:
             f"Environment {target!r} not found in Flagsmith project {project_id}."
         )
 
+    def get_environment_details(self, environment_api_key: str) -> dict[str, Any]:
+        """Return environment metadata including ``use_v2_feature_versioning``."""
+        payload = self._request("GET", f"environments/{environment_api_key}/")
+        return dict(payload)
+
     def _find_feature(self, project_id: int, feature_name: str) -> dict[str, Any] | None:
-        # UNVERIFIED: check against local instance
         payload = self._request("GET", f"projects/{project_id}/features/")
         for feat in self._extract_results(payload):
             if feat.get("name") == feature_name:
@@ -242,25 +251,42 @@ class FlagsmithManagementClient:
             )
         return int(feat["id"])
 
-    def _list_feature_states(self, environment_api_key: str) -> list[dict[str, Any]]:
-        # UNVERIFIED: check against local instance
-        payload = self._request("GET", f"environments/{environment_api_key}/featurestates/")
-        return self._extract_results(payload)
+    def _get_future_feature_state(
+        self,
+        environment_api_key: str,
+        feature_id: int,
+    ) -> dict[str, Any]:
+        """Fetch environment default and all segment overrides (works in v1 and v2)."""
+        payload = self._request(
+            "GET",
+            f"api/__future__/environments/{environment_api_key}/features/{feature_id}/",
+        )
+        return dict(payload)
+
+    def _patch_future_feature_state(
+        self,
+        environment_api_key: str,
+        feature_id: int,
+        json_body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Patch environment default or segment overrides (works in v1 and v2)."""
+        payload = self._request(
+            "PATCH",
+            f"api/__future__/environments/{environment_api_key}/features/{feature_id}/",
+            json_body=json_body,
+        )
+        return dict(payload)
 
     @staticmethod
-    def _state_feature_id(state: dict[str, Any]) -> int | None:
-        feature = state.get("feature")
-        if isinstance(feature, dict) and "id" in feature:
-            return int(feature["id"])
-        if isinstance(feature, int):
-            return feature
-        return None
-
-    @staticmethod
-    def _state_segment_id(state: dict[str, Any]) -> int | None:
-        feature_segment = state.get("feature_segment")
-        if isinstance(feature_segment, dict) and feature_segment.get("segment") is not None:
-            return int(feature_segment["segment"])
+    def _find_segment_override(
+        future_state: dict[str, Any],
+        segment_id: int,
+    ) -> dict[str, Any] | None:
+        for override in future_state.get("segment_overrides", []):
+            seg = override.get("segment")
+            seg_id = seg.get("id") if isinstance(seg, dict) else seg
+            if seg_id == segment_id:
+                return dict(override)
         return None
 
     def create_feature(
@@ -280,7 +306,6 @@ class FlagsmithManagementClient:
         if existing is not None:
             return existing
 
-        # UNVERIFIED: check against local instance
         created = self._request(
             "POST",
             f"projects/{resolved_project}/features/",
@@ -307,7 +332,6 @@ class FlagsmithManagementClient:
         validated_percent = _validate_percentage(percent)
         resolved_project = self.resolve_project_id(project_id)
 
-        # UNVERIFIED: check against local instance
         payload = self._request("GET", f"projects/{resolved_project}/segments/")
         existing = next(
             (seg for seg in self._extract_results(payload) if seg.get("name") == clean_name),
@@ -320,7 +344,6 @@ class FlagsmithManagementClient:
             "rules": self._percentage_split_rules(validated_percent),
         }
         if existing is None:
-            # UNVERIFIED: check against local instance
             created = self._request(
                 "POST",
                 f"projects/{resolved_project}/segments/",
@@ -329,7 +352,6 @@ class FlagsmithManagementClient:
             return dict(created)
 
         segment_id = int(existing["id"])
-        # UNVERIFIED: check against local instance
         updated = self._request(
             "PUT",
             f"projects/{resolved_project}/segments/{segment_id}/",
@@ -350,14 +372,12 @@ class FlagsmithManagementClient:
         resolved_project = self.resolve_project_id(project_id)
         segment_name = name
         if segment_name is None:
-            # UNVERIFIED: check against local instance
             current = self._request(
                 "GET",
                 f"projects/{resolved_project}/segments/{segment_id}/",
             )
             segment_name = str(current["name"])
 
-        # UNVERIFIED: check against local instance
         updated = self._request(
             "PUT",
             f"projects/{resolved_project}/segments/{segment_id}/",
@@ -380,50 +400,33 @@ class FlagsmithManagementClient:
         project_id: int | None = None,
         environment: str | None = None,
     ) -> dict[str, Any]:
-        """Attach (or update) a segment override for a feature in the target environment."""
+        """Attach (or update) a segment override without altering the global default."""
         resolved_project = self.resolve_project_id(project_id)
-        environment_id, env_api_key = self.resolve_environment(resolved_project, environment)
+        _, env_api_key = self.resolve_environment(resolved_project, environment)
         feature_id = self._get_feature_id(resolved_project, feature_name)
+        current = self._get_future_feature_state(env_api_key, feature_id)
+        existing = self._find_segment_override(current, segment_id)
 
-        for state in self._list_feature_states(env_api_key):
-            if (
-                self._state_feature_id(state) == feature_id
-                and self._state_segment_id(state) == segment_id
-            ):
-                state_id = int(state["id"])
-                # UNVERIFIED: check against local instance
-                patched = self._request(
-                    "PATCH",
-                    f"environments/{env_api_key}/featurestates/{state_id}/",
-                    json_body={"enabled": enabled},
-                )
-                return dict(patched)
-
-        # UNVERIFIED: check against local instance
-        created_segment = self._request(
-            "POST",
-            "features/feature-segments/",
-            json_body={
-                "feature": feature_id,
-                "segment": segment_id,
-                "environment": environment_id,
-                "priority": priority,
+        updated = self._patch_future_feature_state(
+            env_api_key,
+            feature_id,
+            {
+                "segment_overrides": [
+                    {
+                        "segment": {"id": segment_id},
+                        "enabled": enabled,
+                        "priority": existing.get("priority", priority) if existing else priority,
+                        "value": existing.get("value") if existing else None,
+                    }
+                ]
             },
         )
-        feature_segment_id = int(created_segment["id"])
-
-        # UNVERIFIED: check against local instance
-        created_state = self._request(
-            "POST",
-            "features/featurestates/",
-            json_body={
-                "enabled": enabled,
-                "feature": feature_id,
-                "environment": environment_id,
-                "feature_segment": feature_segment_id,
-            },
-        )
-        return dict(created_state)
+        result = self._find_segment_override(updated, segment_id)
+        if result is None:
+            raise FlagsmithAPIError(
+                f"Segment override segment_id={segment_id} missing after PATCH on {feature_name!r}."
+            )
+        return result
 
     def disable_override(
         self,
@@ -437,27 +440,43 @@ class FlagsmithManagementClient:
         resolved_project = self.resolve_project_id(project_id)
         _, env_api_key = self.resolve_environment(resolved_project, environment)
         feature_id = self._get_feature_id(resolved_project, feature_name)
+        current = self._get_future_feature_state(env_api_key, feature_id)
 
-        for state in self._list_feature_states(env_api_key):
-            if self._state_feature_id(state) != feature_id:
-                continue
-            state_seg_id = self._state_segment_id(state)
-            if (segment_id is None and state_seg_id is None) or (
-                segment_id is not None and state_seg_id == segment_id
-            ):
-                state_id = int(state["id"])
-                # UNVERIFIED: check against local instance
-                patched = self._request(
-                    "PATCH",
-                    f"environments/{env_api_key}/featurestates/{state_id}/",
-                    json_body={"enabled": False},
-                )
-                return dict(patched)
+        if segment_id is None:
+            default_val = (current.get("environment_default") or {}).get("value")
+            updated = self._patch_future_feature_state(
+                env_api_key,
+                feature_id,
+                {"environment_default": {"enabled": False, "value": default_val}},
+            )
+            return dict(updated.get("environment_default") or {"enabled": False})
 
-        target_desc = f"segment_id={segment_id}" if segment_id is not None else "environment default"
-        raise FlagsmithAPIError(
-            f"No feature state found for feature {feature_name!r} ({target_desc})."
+        existing = self._find_segment_override(current, segment_id)
+        if existing is None:
+            raise FlagsmithAPIError(
+                f"No feature state found for feature {feature_name!r} (segment_id={segment_id})."
+            )
+
+        updated = self._patch_future_feature_state(
+            env_api_key,
+            feature_id,
+            {
+                "segment_overrides": [
+                    {
+                        "segment": {"id": segment_id},
+                        "enabled": False,
+                        "priority": existing.get("priority", 0),
+                        "value": existing.get("value"),
+                    }
+                ]
+            },
         )
+        result = self._find_segment_override(updated, segment_id)
+        if result is None:
+            raise FlagsmithAPIError(
+                f"Segment override segment_id={segment_id} missing after disable PATCH."
+            )
+        return result
 
     def get_state(
         self,
@@ -467,26 +486,14 @@ class FlagsmithManagementClient:
         project_id: int | None = None,
         environment: str | None = None,
     ) -> dict[str, Any]:
-        """Get current feature state and segment overrides in the target environment."""
+        """Get current environment default and segment overrides (v1 and v2 compatible)."""
         resolved_project = self.resolve_project_id(project_id)
         environment_id, env_api_key = self.resolve_environment(resolved_project, environment)
         feature_id = self._get_feature_id(resolved_project, feature_name)
-        matching_states = [
-            state
-            for state in self._list_feature_states(env_api_key)
-            if self._state_feature_id(state) == feature_id
-        ]
-
-        default_state = next(
-            (s for s in matching_states if self._state_segment_id(s) is None),
-            None,
-        )
-        segment_overrides = [s for s in matching_states if self._state_segment_id(s) is not None]
+        future_state = self._get_future_feature_state(env_api_key, feature_id)
+        segment_overrides = list(future_state.get("segment_overrides", []))
         selected_override = (
-            next(
-                (s for s in segment_overrides if self._state_segment_id(s) == segment_id),
-                None,
-            )
+            self._find_segment_override(future_state, segment_id)
             if segment_id is not None
             else None
         )
@@ -496,13 +503,13 @@ class FlagsmithManagementClient:
             "environment_id": environment_id,
             "feature_name": feature_name,
             "feature_id": feature_id,
-            "default_state": default_state,
+            "default_state": future_state.get("environment_default"),
             "segment_override": selected_override,
             "segment_overrides": segment_overrides,
         }
 
     def apply_stage(self, plan: Plan, percentage: int) -> RolloutChange:
-        """Apply a staged rollout percentage via a PERCENTAGE_SPLIT segment override."""
+        """Apply a staged rollout percentage via PERCENTAGE_SPLIT without enabling global default."""
         segment_name = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
         project_id = self.resolve_project_id(plan.project_id)
         _, env_api_key = self.resolve_environment(project_id, plan.environment)
@@ -546,5 +553,5 @@ class FlagsmithManagementClient:
         )
 
     def rollback(self, plan: Plan) -> RolloutChange:
-        """Roll back the staged rollout segment to ``plan.rollback_percentage``."""
+        """Roll back the staged rollout segment to ``plan.rollback_percentage`` (default 0%)."""
         return self.apply_stage(plan, plan.rollback_percentage)

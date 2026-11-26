@@ -118,3 +118,29 @@ def test_exact_injected_spike_rate_with_fixed_exposed_set() -> None:
     assert result.exposed_error_rate == pytest.approx(1.0)
     assert result.overall_error_rate == pytest.approx(0.40)
 
+
+def test_simulator_refreshes_evaluator_and_monotonic_exposure() -> None:
+    """TrafficSimulator calls evaluator.refresh() each round and exposure grows monotonically."""
+
+    class _RefreshableOfflineEvaluator(OfflineFakeEvaluator):
+        def __init__(self) -> None:
+            super().__init__(rollout_percentage=10)
+            self.refresh_calls = 0
+
+        def refresh(self) -> None:
+            self.refresh_calls += 1
+
+    evaluator = _RefreshableOfflineEvaluator()
+    sim = TrafficSimulator(evaluator, user_count=200, seed=42)
+
+    r10 = sim.run_round("checkout_v2")
+    evaluator.set_percentage(50)
+    r50 = sim.run_round("checkout_v2")
+    evaluator.set_percentage(0)
+    r0 = sim.run_round("checkout_v2")
+
+    assert evaluator.refresh_calls == 3
+    assert set(r10.exposed_identities).issubset(set(r50.exposed_identities))
+    assert r50.exposed_count > r10.exposed_count
+    assert r0.exposed_count == 0
+

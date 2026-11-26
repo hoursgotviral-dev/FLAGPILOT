@@ -1,12 +1,25 @@
+# Secrets & environment files
 .env
-.venv/
-.pytest_cache/
-.ruff_cache/
-scratch/
-__pycache__/
-*.py[cod]
-*.egg-info/
-reports/
-audit.log
+flagsmith.env
+*.env.local
 *.key
 
+# Rollout logs & generated HTML/JSON rollout reports
+audit.log
+reports/
+rollout.html
+last_run.json
+scratch/
+
+# Virtual environments & caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Packaging & build artifacts
+dist/
+build/
+*.egg-info/

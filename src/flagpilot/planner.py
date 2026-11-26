@@ -271,9 +271,9 @@ def planned_api_calls(plan: Plan) -> list[str]:
                 f'PERCENTAGE_SPLIT value="{step.percentage}"'
             )
             calls.append(
-                "GET /api/v1/environments/<environment_api_key>/featurestates/  "
-                "-> POST /api/v1/features/feature-segments/ & POST /api/v1/features/featurestates/ "
-                '(or PATCH .../featurestates/<state_id>/ with {"enabled": true})'
+                "GET /api/__future__/environments/<environment_api_key>/features/<feature_id>/  "
+                "-> PATCH /api/__future__/environments/<environment_api_key>/features/<feature_id>/ "
+                'with {"segment_overrides": [{"segment": {"id": <segment_id>}, "enabled": true, "priority": 0, "value": null}]}'
             )
         else:
             calls.append(
@@ -290,7 +290,7 @@ def plan_risks(plan: Plan) -> list[str]:
         "Percentage Split (% Split) hashes persistent user identities; anonymous SDK calls will not match.",
         f"Applying this plan immediately exposes up to {final_pct}% of identified users in {plan.environment}.",
         "Existing segment overrides on this feature may compete based on priority (FlagPilot sets priority=0).",
-        "Management REST endpoints remain marked UNVERIFIED until tested against your local Flagsmith instance.",
+        "Endpoints target self-hosted Flagsmith Management REST API (verified against Flagsmith 2.295.2).",
     ]
 
 

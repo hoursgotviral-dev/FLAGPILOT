@@ -178,25 +178,50 @@ def test_fsapi_all_six_methods_with_mocks() -> None:
     assert put_seg.kwargs["method"] == "PUT"
     assert put_seg.kwargs["json"]["rules"][0]["conditions"][0]["value"] == "50"
 
-    # 4. attach_segment_override
+    # 4. attach_segment_override (via /api/__future__/environments/{env}/features/{id}/)
     session.request.side_effect = [
         _mock_response([{"id": 7, "name": "prod", "api_key": "env-key-1"}]),
         _mock_response([{"id": 99, "name": "checkout_v2"}]),
-        _mock_response([]),  # existing featurestates
-        _mock_response({"id": 600}, 201),  # POST feature-segments/
-        _mock_response({"id": 700, "enabled": True}, 201),  # POST featurestates/
+        _mock_response(
+            {"environment_default": {"enabled": False, "value": None}, "segment_overrides": []}
+        ),
+        _mock_response(
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    {"segment": {"id": 500}, "priority": 0, "enabled": True, "value": None}
+                ],
+            }
+        ),
     ]
     attached = client.attach_segment_override("checkout_v2", 500, enabled=True)
-    assert attached["id"] == 700
+    assert attached["segment"]["id"] == 500
+    assert attached["enabled"] is True
+    patch_call = session.request.call_args_list[-1]
+    assert patch_call.kwargs["method"] == "PATCH"
+    assert patch_call.kwargs["url"].endswith("/api/__future__/environments/env-key-1/features/99/")
+    assert "environment_default" not in patch_call.kwargs["json"]
 
     # 5. disable_override
     session.request.side_effect = [
         _mock_response([{"id": 7, "name": "prod", "api_key": "env-key-1"}]),
         _mock_response([{"id": 99, "name": "checkout_v2"}]),
         _mock_response(
-            [{"id": 700, "feature": 99, "feature_segment": {"id": 600, "segment": 500}}]
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    {"segment": {"id": 500}, "priority": 0, "enabled": True, "value": None}
+                ],
+            }
         ),
-        _mock_response({"id": 700, "enabled": False}),
+        _mock_response(
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    {"segment": {"id": 500}, "priority": 0, "enabled": False, "value": None}
+                ],
+            }
+        ),
     ]
     disabled = client.disable_override("checkout_v2", segment_id=500)
     assert disabled["enabled"] is False
@@ -206,21 +231,19 @@ def test_fsapi_all_six_methods_with_mocks() -> None:
         _mock_response([{"id": 7, "name": "prod", "api_key": "env-key-1"}]),
         _mock_response([{"id": 99, "name": "checkout_v2"}]),
         _mock_response(
-            [
-                {"id": 10, "feature": 99, "enabled": False, "feature_segment": None},
-                {
-                    "id": 700,
-                    "feature": 99,
-                    "enabled": False,
-                    "feature_segment": {"id": 600, "segment": 500},
-                },
-            ]
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    {"segment": {"id": 500}, "priority": 0, "enabled": False, "value": None}
+                ],
+            }
         ),
     ]
     state = client.get_state("checkout_v2", segment_id=500)
     assert state["feature_id"] == 99
-    assert state["default_state"]["id"] == 10
-    assert state["segment_override"]["id"] == 700
+    assert state["default_state"]["enabled"] is False
+    assert state["segment_override"]["segment"]["id"] == 500
+    assert state["segment_override"]["enabled"] is False
 
 
 def test_fsapi_errors_include_response_body_and_never_leak_keys() -> None:
@@ -276,9 +299,17 @@ def test_fsapi_apply_stage_and_rollback_orchestration() -> None:
         _mock_response({"id": 500, "name": "flagpilot-checkout_v2-rollout"}, 201),
         _mock_response([{"id": 7, "name": "prod", "api_key": "env-key-1"}]),
         _mock_response([{"id": 99, "name": "checkout_v2"}]),
-        _mock_response([]),  # GET featurestates/
-        _mock_response({"id": 600}, 201),  # POST feature-segments/
-        _mock_response({"id": 700, "enabled": True}, 201),  # POST featurestates/
+        _mock_response(
+            {"environment_default": {"enabled": False, "value": None}, "segment_overrides": []}
+        ),
+        _mock_response(
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    {"segment": {"id": 500}, "priority": 0, "enabled": True, "value": None}
+                ],
+            }
+        ),
         # rollback(0%):
         _mock_response([{"id": 42, "name": "Demo"}]),
         _mock_response([{"id": 7, "name": "prod", "api_key": "env-key-1"}]),
@@ -288,14 +319,31 @@ def test_fsapi_apply_stage_and_rollback_orchestration() -> None:
         _mock_response([{"id": 7, "name": "prod", "api_key": "env-key-1"}]),
         _mock_response([{"id": 99, "name": "checkout_v2"}]),
         _mock_response(
-            [{"id": 700, "feature": 99, "feature_segment": {"id": 600, "segment": 500}}]
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    {"segment": {"id": 500}, "priority": 0, "enabled": True, "value": None}
+                ],
+            }
         ),
         _mock_response([{"id": 7, "name": "prod", "api_key": "env-key-1"}]),
         _mock_response([{"id": 99, "name": "checkout_v2"}]),
         _mock_response(
-            [{"id": 700, "feature": 99, "feature_segment": {"id": 600, "segment": 500}}]
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    {"segment": {"id": 500}, "priority": 0, "enabled": True, "value": None}
+                ],
+            }
         ),
-        _mock_response({"id": 700, "enabled": False}),
+        _mock_response(
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    {"segment": {"id": 500}, "priority": 0, "enabled": False, "value": None}
+                ],
+            }
+        ),
     ]
 
     client = FlagsmithManagementClient(

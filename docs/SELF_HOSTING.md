@@ -3,30 +3,39 @@
 ## Prerequisites
 
 - Python `>= 3.11`
-- A local self-hosted Flagsmith instance (for example via Flagsmith's Docker Compose setup, managed outside this repository)
-- An Admin / Organisation API token (`FLAGSMITH_ADMIN_KEY`) and environment SDK key (`FLAGSMITH_SERVER_KEY` or `FLAGSMITH_CLIENT_KEY`)
+- Docker & Docker Compose (with ports `8000` and `8001` free)
 
-## Flagsmith Setup
+## Flagsmith Setup (Zero-Click Bootstrap)
 
-1. Start your self-hosted Flagsmith instance (for example on `http://localhost:8000`).
-2. Create an organisation, project, and environment (such as `Development`) in the Flagsmith dashboard.
-3. Generate an Organisation API Key (for the REST Management API) and copy the environment's Server-Side SDK Key (for `FlagsmithSDKEvaluator`).
-4. Note that all Management API paths and Python SDK evaluation calls in `src/flagpilot/fsapi.py` and `src/flagpilot/simulator.py` are currently **UNVERIFIED** against a live instance; verify each endpoint against your local Flagsmith API docs (`/api/v1/docs/`) before relying on them in production.
+1. Start the official self-hosted Flagsmith stack from the repository root:
+
+   ```bash
+   docker compose up -d
+   ```
+
+2. Run FlagPilot's idempotent bootstrapper (polls `http://localhost:8000/health/liveness/`, checks `GET /version/`, creates the initial superuser or logs in, creates/reuses organisation/project/environment, mints or preserves the Master API key and server SDK key, creates the `checkout_v2` demo feature with global default `false` and a `0%` `PERCENTAGE_SPLIT` segment override, and writes local `.env` without printing secrets):
+
+   - **macOS / Linux**: `.venv/bin/flagpilot bootstrap` (or `make up && make bootstrap`)
+   - **Windows PowerShell**: `.venv\Scripts\flagpilot.exe bootstrap` (or `.\tasks.ps1 up; .\tasks.ps1 bootstrap`)
+
+3. Re-running `flagpilot bootstrap` is safe and idempotent: existing valid Master API keys and server SDK keys in `.env` are preserved.
 
 ## Environment Configuration
 
-Copy `.env.example` to `.env` (gitignored; never commit `.env` or paste keys into terminal logs) and fill in your local values:
+`flagpilot bootstrap` creates and updates `.env` (gitignored) automatically. See `.env.example` for the full schema:
 
 ```text
-FLAGSMITH_API_URL=http://localhost:8000/api/v1
-FLAGSMITH_CLIENT_KEY=<your-client-key>
-FLAGSMITH_SERVER_KEY=<your-server-key>
-FLAGSMITH_ADMIN_KEY=<your-organisation-api-key>
+FLAGSMITH_API_URL=http://localhost:8000
+FLAGSMITH_ADMIN_KEY=<master-api-key>
+FLAGSMITH_CLIENT_KEY=<environment-client-key>
+FLAGSMITH_SERVER_KEY=<ser.server-sdk-key>
+FLAGSMITH_ENVIRONMENT_KEY=<environment-client-key>
+FLAGSMITH_PROJECT_ID=<project-id>
+FLAGSMITH_FEATURE_ID=<feature-id>
+FLAGSMITH_SEGMENT_ID=<segment-id>
 ```
 
-Optional environment variables supported by `FlagsmithConfig.from_env()`:
-- `FLAGSMITH_PROJECT_ID` (numeric project ID; if omitted, FlagPilot queries `GET /api/v1/projects/` — **UNVERIFIED**)
-- `FLAGSMITH_ENVIRONMENT_KEY` (defaults to `FLAGSMITH_SERVER_KEY` or `FLAGSMITH_CLIENT_KEY`)
+Never commit `.env` or print keys into terminal logs or reports.
 
 ## Running FlagPilot
 
@@ -34,12 +43,22 @@ Install locally in a virtual environment:
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ".[dev]"   # Windows: .venv\Scripts\pip.exe install -e ".[dev]"
 ```
 
-Run the demo steps interactively (typing `APPROVE` at each prompt):
+Run the end-to-end interactive demo (type `APPROVE` at each prompt):
 
-- **POSIX / Git Bash**: `bash scripts/demo` or `make demo`
+- **macOS / Linux (`bash`)**: `bash scripts/demo` or `make demo`
 - **Windows PowerShell**: `.\tasks.ps1 demo`
 
-To exercise the controller and simulator purely offline without a running Flagsmith SDK endpoint for traffic evaluation, pass `--offline-evaluator` to `flagpilot run` (writes still require an interactive `APPROVE` and a `FlagsmithClient` backend).
+Run the live integration smoke test against `http://localhost:8000`:
+
+- **macOS / Linux**: `make smoke` (`FLAGPILOT_LIVE_TEST=1 .venv/bin/pytest -m live -v`)
+- **Windows PowerShell**: `.\tasks.ps1 smoke`
+
+Shut down containers when finished (`docker compose down`, or `docker compose down -v` to wipe Flagsmith database state).
+
+## Planner Modes (Zero-Key Default vs. Optional LLM Adapter)
+
+- **Default zero-key planner (`src/flagpilot/planner.py`)**: Deterministic regex/rule-based parser (`parse_plain_english_request`) that converts plain-English requests into `plan.json` and `plan.md` with zero external LLM dependencies or API keys.
+- **Optional LLM adapter boundary**: Because downstream stages consume the validated `Plan` schema (`build_plan` / `plan_from_dict` in `src/flagpilot/planner.py`), you can optionally place an external LLM translator upstream to emit `plan.json`. All Flagsmith writes still pass through `src/flagpilot/apply.py`'s mandatory interactive `APPROVE` gate.

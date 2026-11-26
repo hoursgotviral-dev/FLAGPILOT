@@ -213,6 +213,11 @@ def test_controller_spike_at_first_step_rolls_back_to_0(tmp_path: Path) -> None:
     assert client.percentage_history == [1, 0]
     assert client.disabled_calls == [("checkout_v2", 7)]
 
+    # Subsequent evaluation tick confirms 0 enabled identities after rollback to 0%.
+    eval_after = OfflineFakeEvaluator(rollout_percentage=client.percentage_history[-1])
+    post_round = TrafficSimulator(eval_after, user_count=200, seed=42).run_round("checkout_v2")
+    assert post_round.exposed_count == 0
+
 
 def test_manual_rollback_sets_zero_and_logs_audit(tmp_path: Path) -> None:
     """Manual rollback sets segment percentage to 0, disables override, and logs audit.log."""

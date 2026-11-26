@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("help", "install", "test", "lint", "demo-plan", "demo-apply", "demo-run", "demo-rollback", "demo-report", "demo")]
+    [ValidateSet("help", "install", "test", "lint", "smoke", "up", "bootstrap", "down", "demo-plan", "demo-apply", "demo-run", "demo-rollback", "demo-report", "demo")]
     [string]$Task = "help"
 )
 
@@ -11,9 +11,18 @@ $FlagPilot = if (Test-Path ".venv\Scripts\flagpilot.exe") { ".venv\Scripts\flagp
 $Pytest = if (Test-Path ".venv\Scripts\pytest.exe") { ".venv\Scripts\pytest.exe" } else { "pytest" }
 $Ruff = if (Test-Path ".venv\Scripts\ruff.exe") { ".venv\Scripts\ruff.exe" } else { "ruff" }
 
+function Test-FlagsmithLive {
+    try {
+        & $Python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/liveness/', timeout=2).status == 200 else 1)" 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
 switch ($Task) {
     "help" {
-        Write-Host "Available tasks: install, test, lint, demo-plan, demo-apply, demo-run, demo-rollback, demo-report, demo"
+        Write-Host "Available targets: help install test lint smoke up bootstrap down demo-plan demo-apply demo-run demo-rollback demo-report demo"
     }
     "install" {
         python -m venv .venv
@@ -24,6 +33,23 @@ switch ($Task) {
     }
     "lint" {
         & $Ruff check src tests
+    }
+    "smoke" {
+        $env:FLAGPILOT_LIVE_TEST = "1"
+        try {
+            & $Pytest -m live -v
+        } finally {
+            Remove-Item Env:FLAGPILOT_LIVE_TEST -ErrorAction SilentlyContinue
+        }
+    }
+    "up" {
+        docker compose up -d
+    }
+    "bootstrap" {
+        & $FlagPilot bootstrap
+    }
+    "down" {
+        docker compose down
     }
     "demo-plan" {
         Write-Host "=== [1/5] PLAN (offline, no Flagsmith calls) ==="
@@ -59,16 +85,22 @@ switch ($Task) {
         & $FlagPilot report --input reports/last_run.json --audit-log audit.log --out reports/rollout.html
     }
     "demo" {
+        Write-Host "=== [0/5] ENSURE FLAGSMITH IS UP ==="
+        if (-not (Test-FlagsmithLive)) {
+            & $MyInvocation.MyCommand.Path up
+        }
+        if (-not (Test-Path ".env")) {
+            Write-Host "=== [0.5/5] BOOTSTRAP LOCAL FLAGSMITH (.env missing) ==="
+            & $MyInvocation.MyCommand.Path bootstrap
+        }
         & $MyInvocation.MyCommand.Path demo-plan
         & $MyInvocation.MyCommand.Path demo-apply
-        try {
-            & $MyInvocation.MyCommand.Path demo-run
-        } catch {
-            Write-Host "Run exited with non-zero status (expected when spike triggers rollback)."
+        & $MyInvocation.MyCommand.Path demo-run
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Run exited with code $LASTEXITCODE (expected when spike triggers rollback)."
         }
         & $MyInvocation.MyCommand.Path demo-rollback
         & $MyInvocation.MyCommand.Path demo-report
         Write-Host "Demo complete. Open reports/rollout.html in a browser."
     }
 }
-

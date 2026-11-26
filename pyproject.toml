@@ -29,6 +29,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live: integration tests requiring a live self-hosted Flagsmith server at http://localhost:8000",
+]
 
 [tool.ruff]
 target-version = "py311"

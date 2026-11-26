@@ -354,12 +354,15 @@ def render_html_report(
 
     audit_rows: list[str] = []
     for entry in audit_entries:
+        if "old_percentage" in entry and "new_percentage" in entry:
+            change_text = f"{entry['old_percentage']}% → {entry['new_percentage']}%"
+        else:
+            change_text = f"→ {entry.get('percentage', '')}%"
         audit_rows.append(
             "<tr>"
             f'<td class="mono">{html.escape(str(entry.get("timestamp", "")))}</td>'
             f"<td>{html.escape(str(entry.get('action', '')))}</td>"
-            f"<td>{html.escape(str(entry.get('old_percentage', '')))}% → "
-            f"{html.escape(str(entry.get('new_percentage', '')))}%</td>"
+            f"<td>{html.escape(change_text)}</td>"
             f"<td>{html.escape(str(entry.get('reason', '')))}</td>"
             "</tr>"
         )

@@ -40,6 +40,8 @@ def append_audit_entry(
     new_percentage: int,
     reason: str,
     observed_error_rate: float | None = None,
+    exposed_count: int | None = None,
+    sample_count: int | None = None,
 ) -> None:
     """Append a secret-free decision entry with UTC timestamp to ``audit.log``."""
     if audit_log_path is None:
@@ -55,6 +57,10 @@ def append_audit_entry(
     }
     if observed_error_rate is not None:
         entry["observed_error_rate"] = observed_error_rate
+    if exposed_count is not None:
+        entry["exposed_count"] = exposed_count
+    if sample_count is not None:
+        entry["sample_count"] = sample_count
     audit_log_path.parent.mkdir(parents=True, exist_ok=True)
     with audit_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry) + "\n")
@@ -138,6 +144,7 @@ class RolloutController:
         sleep_fn: Callable[[float], None] = time.sleep,
         audit_log_path: Path | None = Path("audit.log"),
         output_stream: TextIO | None = None,
+        rollback_to_zero: bool = False,
     ) -> None:
         if interval_seconds < 0:
             raise ValueError("interval_seconds must be >= 0.")
@@ -147,6 +154,7 @@ class RolloutController:
         self._sleep_fn = sleep_fn
         self._audit_log_path = audit_log_path
         self._output_stream = output_stream if output_stream is not None else sys.stdout
+        self._rollback_to_zero = rollback_to_zero
 
     def _log_decision(
         self,
@@ -157,6 +165,8 @@ class RolloutController:
         new_percentage: int,
         reason: str,
         observed_error_rate: float | None = None,
+        exposed_count: int | None = None,
+        sample_count: int | None = None,
     ) -> None:
         append_audit_entry(
             self._audit_log_path,
@@ -167,6 +177,8 @@ class RolloutController:
             new_percentage=new_percentage,
             reason=reason,
             observed_error_rate=observed_error_rate,
+            exposed_count=exposed_count,
+            sample_count=sample_count,
         )
 
     def run(self, plan: Plan, *, is_synthetic: bool = True) -> RolloutRunResult:
@@ -203,13 +215,16 @@ class RolloutController:
 
             metrics = self._signal_provider.collect(plan, step)
             next_step = steps[index + 1] if index + 1 < len(steps) else None
+            rollback_target = (
+                plan.rollback_percentage if self._rollback_to_zero else previous_safe_percentage
+            )
             decision = evaluate_stage(
                 step=step,
                 sample_count=metrics.sample_count,
                 error_count=metrics.error_count,
                 next_step=next_step,
                 observed_error_rate=metrics.error_rate,
-                rollback_target=previous_safe_percentage,
+                rollback_target=rollback_target,
             )
             outcomes.append(
                 StageOutcome(
@@ -230,6 +245,8 @@ class RolloutController:
                 ),
                 reason=decision.reason,
                 observed_error_rate=decision.observed_error_rate,
+                exposed_count=metrics.enabled_count,
+                sample_count=metrics.sample_count,
             )
 
             if decision.action in ("hold", "pause"):
@@ -245,7 +262,6 @@ class RolloutController:
                 )
 
             if decision.action == "rollback":
-                rollback_target = previous_safe_percentage
                 self._output_stream.write(
                     f"Rollback triggered at {step.percentage}% -> {rollback_target}%: "
                     f"{decision.reason}\n"

@@ -3,7 +3,12 @@ FLAGPILOT ?= .venv/bin/flagpilot
 PYTEST ?= .venv/bin/pytest
 RUFF ?= .venv/bin/ruff
 
-.PHONY: install test lint demo demo-plan demo-apply demo-run demo-rollback demo-report
+.DEFAULT_GOAL := help
+
+.PHONY: help install test lint smoke up bootstrap down demo demo-plan demo-apply demo-run demo-rollback demo-report
+
+help:
+	@echo "Available targets: help install test lint smoke up bootstrap down demo-plan demo-apply demo-run demo-rollback demo-report demo"
 
 install:
 	python3 -m venv .venv
@@ -14,6 +19,18 @@ test:
 
 lint:
 	$(RUFF) check src tests
+
+smoke:
+	FLAGPILOT_LIVE_TEST=1 $(PYTEST) -m live -v
+
+up:
+	docker compose up -d
+
+bootstrap:
+	$(FLAGPILOT) bootstrap
+
+down:
+	docker compose down
 
 demo-plan:
 	$(FLAGPILOT) plan "roll out checkout_v2 to 10% in Development, pause if errors exceed 2%"
@@ -48,4 +65,3 @@ demo-report:
 
 demo:
 	bash scripts/demo
-

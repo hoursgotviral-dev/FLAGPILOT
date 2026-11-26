@@ -1,16 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# FlagPilot end-to-end demo script.
-# Every write to Flagsmith pauses for interactive human APPROVE input.
+# FlagPilot end-to-end demo script (POSIX/bash for macOS and Linux).
+# Ensures Flagsmith is up, bootstraps .env if missing, and runs the full demo.
+# Every write during apply/run/rollback pauses for interactive human APPROVE input.
 
-FLAGPILOT_BIN="${FLAGPILOT_BIN:-flagpilot}"
-if [[ -x ".venv/bin/flagpilot" ]]; then
-  FLAGPILOT_BIN=".venv/bin/flagpilot"
-elif [[ -x ".venv/Scripts/flagpilot.exe" ]]; then
-  FLAGPILOT_BIN=".venv/Scripts/flagpilot.exe"
+FLAGPILOT_BIN="${FLAGPILOT_BIN:-}"
+if [[ -z "$FLAGPILOT_BIN" ]]; then
+  if [[ -x ".venv/bin/flagpilot" ]]; then
+    FLAGPILOT_BIN=".venv/bin/flagpilot"
+  else
+    FLAGPILOT_BIN="$(command -v flagpilot || true)"
+  fi
 fi
 
+if [[ -z "$FLAGPILOT_BIN" ]]; then
+  echo "Error: flagpilot binary not found. Run 'make install' first." >&2
+  exit 1
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+  if [[ -x ".venv/bin/python" ]]; then
+    PYTHON_BIN=".venv/bin/python"
+  else
+    PYTHON_BIN="$(command -v python3 || command -v python || true)"
+  fi
+fi
+
+is_flagsmith_live() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 2 "http://localhost:8000/health/liveness/" >/dev/null 2>&1
+    return $?
+  elif [[ -n "$PYTHON_BIN" ]]; then
+    "$PYTHON_BIN" -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/liveness/', timeout=2).status == 200 else 1)" 2>/dev/null
+    return $?
+  fi
+  return 1
+}
+
+echo "=== [0/5] ENSURE FLAGSMITH IS UP ==="
+if ! is_flagsmith_live; then
+  docker compose up -d
+  for _ in $(seq 1 30); do
+    if is_flagsmith_live; then
+      break
+    fi
+    sleep 2
+  done
+fi
+
+if [[ ! -f ".env" ]]; then
+  echo "=== [0.5/5] BOOTSTRAP LOCAL FLAGSMITH (.env missing) ==="
+  "$FLAGPILOT_BIN" bootstrap
+fi
+
+echo ""
 echo "=== [1/5] PLAN (offline, no Flagsmith calls) ==="
 "$FLAGPILOT_BIN" plan "roll out checkout_v2 to 10% in Development, pause if errors exceed 2%"
 
@@ -52,4 +97,3 @@ echo "=== [5/5] REPORT (static reports/rollout.html from audit.log + reports/las
   --out reports/rollout.html
 
 echo "Demo complete. Open reports/rollout.html in a browser."
-
