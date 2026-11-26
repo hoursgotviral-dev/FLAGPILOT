@@ -46,6 +46,8 @@ def append_audit_entry(
     observed_error_rate: float | None = None,
     exposed_count: int | None = None,
     sample_count: int | None = None,
+    health_status: str | None = None,
+    webhook_sent: bool | None = None,
 ) -> None:
     """Append a secret-free decision entry with UTC timestamp to ``audit.log``."""
     if audit_log_path is None:
@@ -65,6 +67,10 @@ def append_audit_entry(
         entry["exposed_count"] = exposed_count
     if sample_count is not None:
         entry["sample_count"] = sample_count
+    if health_status is not None:
+        entry["health_status"] = health_status
+    if webhook_sent is not None:
+        entry["webhook_sent"] = webhook_sent
     audit_log_path.parent.mkdir(parents=True, exist_ok=True)
     with audit_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry) + "\n")
@@ -136,27 +142,48 @@ def evaluate_stage(
     )
 
 
-def _safe_notify_health(
+def _notify_and_record_health(
     notifier: HealthNotifier | None,
-    feature_name: str,
-    environment: str,
+    plan: Plan,
     *,
     status: Literal["firing", "resolved"],
     summary: str,
     description: str,
-) -> None:
+    audit_log_path: Path | None,
+    old_percentage: int,
+    new_percentage: int,
+) -> tuple[str | None, bool | None]:
+    """Dispatch Feature Health webhook fail-safely and append an audit entry when configured."""
     if notifier is None or not isinstance(notifier, HealthNotifier):
-        return
+        return None, None
+    health_label = "UNHEALTHY" if status == "firing" else "HEALTHY"
     try:
-        notifier.notify_health(
-            feature_name,
-            environment,
-            status=status,
-            summary=summary,
-            description=description,
+        delivered = bool(
+            notifier.notify_health(
+                plan.feature_name,
+                plan.environment,
+                status=status,
+                summary=summary,
+                description=description,
+            )
         )
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         logger.warning("Feature Health notification (%s) failed: %s", status, exc)
+        delivered = False
+
+    delivery = "webhook delivered" if delivered else "webhook skipped or failed"
+    append_audit_entry(
+        audit_log_path,
+        action="feature_health",
+        feature_name=plan.feature_name,
+        environment=plan.environment,
+        old_percentage=old_percentage,
+        new_percentage=new_percentage,
+        reason=f"Flagsmith Feature Health {health_label} ({delivery}).",
+        health_status=health_label,
+        webhook_sent=delivered,
+    )
+    return health_label, delivered
 
 
 class RolloutController:
@@ -196,6 +223,8 @@ class RolloutController:
         observed_error_rate: float | None = None,
         exposed_count: int | None = None,
         sample_count: int | None = None,
+        health_status: str | None = None,
+        webhook_sent: bool | None = None,
     ) -> None:
         append_audit_entry(
             self._audit_log_path,
@@ -208,6 +237,8 @@ class RolloutController:
             observed_error_rate=observed_error_rate,
             exposed_count=exposed_count,
             sample_count=sample_count,
+            health_status=health_status,
+            webhook_sent=webhook_sent,
         )
 
     def run(self, plan: Plan, *, is_synthetic: bool = True) -> RolloutRunResult:
@@ -318,13 +349,15 @@ class RolloutController:
                         rollback_applied=False,
                         is_synthetic=is_synthetic,
                     )
-                _safe_notify_health(
+                health_status, webhook_sent = _notify_and_record_health(
                     self._health_notifier,
-                    plan.feature_name,
-                    plan.environment,
+                    plan,
                     status="firing",
                     summary=f"FlagPilot rollback triggered at {step.percentage}% -> {rollback_target}%",
                     description=decision.reason,
+                    audit_log_path=self._audit_log_path,
+                    old_percentage=step.percentage,
+                    new_percentage=rollback_target,
                 )
                 return RolloutRunResult(
                     plan=plan,
@@ -333,17 +366,21 @@ class RolloutController:
                     rollback_applied=True,
                     rollback_to_percentage=rollback_target,
                     is_synthetic=is_synthetic,
+                    health_status=health_status,
+                    health_webhook_sent=webhook_sent,
                 )
 
             previous_safe_percentage = step.percentage
 
-        _safe_notify_health(
+        health_status, webhook_sent = _notify_and_record_health(
             self._health_notifier,
-            plan.feature_name,
-            plan.environment,
+            plan,
             status="resolved",
             summary=f"FlagPilot rollout completed for {plan.feature_name}",
             description=f"All {len(steps)} rollout stage(s) passed within threshold.",
+            audit_log_path=self._audit_log_path,
+            old_percentage=current_percentage,
+            new_percentage=current_percentage,
         )
         return RolloutRunResult(
             plan=plan,
@@ -351,6 +388,8 @@ class RolloutController:
             outcomes=tuple(outcomes),
             rollback_applied=False,
             is_synthetic=is_synthetic,
+            health_status=health_status,
+            health_webhook_sent=webhook_sent,
         )
 
 
@@ -376,16 +415,21 @@ def execute_manual_rollback(
         new_percentage=0,
         reason=reason,
     )
-    _safe_notify_health(
-        health_notifier,
-        plan.feature_name,
-        plan.environment,
-        status="resolved",
-        summary=f"FlagPilot manual rollback/reset for {plan.feature_name}",
-        description=reason,
-    )
     out.write(
         f"Rolled back {change.feature_name} ({change.environment}) from "
         f"{old_percentage}% -> 0%: {reason}\n"
     )
+    health_status, webhook_sent = _notify_and_record_health(
+        health_notifier,
+        plan,
+        status="resolved",
+        summary=f"FlagPilot manual rollback/reset for {plan.feature_name}",
+        description=reason,
+        audit_log_path=audit_log_path,
+        old_percentage=old_percentage,
+        new_percentage=0,
+    )
+    if health_status is not None:
+        delivery = "webhook delivered" if webhook_sent else "webhook skipped or failed"
+        out.write(f"Feature Health: {health_status} ({delivery})\n")
     return change

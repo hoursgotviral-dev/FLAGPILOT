@@ -109,6 +109,8 @@ class RolloutRunResult:
     rollback_applied: bool = False
     rollback_to_percentage: int | None = None
     is_synthetic: bool = True
+    health_status: str | None = None
+    health_webhook_sent: bool | None = None
 
 
 @runtime_checkable

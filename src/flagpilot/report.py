@@ -21,6 +21,8 @@ def run_result_to_dict(result: RolloutRunResult) -> dict[str, Any]:
         "rollback_to_percentage": result.rollback_to_percentage,
         "is_synthetic": result.is_synthetic,
         "traffic_label": "SYNTHETIC DATA" if result.is_synthetic else "OBSERVED",
+        "health_status": result.health_status,
+        "health_webhook_sent": result.health_webhook_sent,
         "outcomes": [
             {
                 "step": {
@@ -93,6 +95,8 @@ def run_result_from_dict(data: dict[str, Any]) -> RolloutRunResult:
         rollback_applied=bool(data.get("rollback_applied", False)),
         rollback_to_percentage=data.get("rollback_to_percentage"),
         is_synthetic=bool(data.get("is_synthetic", True)),
+        health_status=data.get("health_status"),
+        health_webhook_sent=data.get("health_webhook_sent"),
     )
 
 
@@ -353,19 +357,47 @@ def render_html_report(
         )
 
     audit_rows: list[str] = []
+    latest_audit_health: tuple[str, bool] | None = None
     for entry in audit_entries:
         if "old_percentage" in entry and "new_percentage" in entry:
             change_text = f"{entry['old_percentage']}% → {entry['new_percentage']}%"
         else:
             change_text = f"→ {entry.get('percentage', '')}%"
+        action_raw = str(entry.get("action", ""))
+        action_cell = html.escape(action_raw)
+        if action_raw == "feature_health":
+            h_status = str(entry.get("health_status", ""))
+            h_sent = bool(entry.get("webhook_sent", False))
+            if h_status:
+                latest_audit_health = (h_status, h_sent)
+            h_badge = "badge-danger" if h_status == "UNHEALTHY" else "badge-ok"
+            action_cell = (
+                f'<span class="badge {h_badge}">{html.escape(h_status or "health")}</span>'
+            )
         audit_rows.append(
             "<tr>"
             f'<td class="mono">{html.escape(str(entry.get("timestamp", "")))}</td>'
-            f"<td>{html.escape(str(entry.get('action', '')))}</td>"
+            f"<td>{action_cell}</td>"
             f"<td>{html.escape(change_text)}</td>"
             f"<td>{html.escape(str(entry.get('reason', '')))}</td>"
             "</tr>"
         )
+
+    def _format_health_summary(status: str, sent: bool | None) -> str:
+        delivery = "webhook delivered" if sent else "webhook skipped/failed"
+        return f"{status} ({delivery})"
+
+    health_summary = "Not configured"
+    if result.health_status is not None:
+        health_summary = _format_health_summary(result.health_status, result.health_webhook_sent)
+        if (
+            latest_audit_health is not None
+            and latest_audit_health[0] != result.health_status
+        ):
+            latest_text = _format_health_summary(latest_audit_health[0], latest_audit_health[1])
+            health_summary = f"{health_summary} → {latest_text}"
+    elif latest_audit_health is not None:
+        health_summary = _format_health_summary(latest_audit_health[0], latest_audit_health[1])
 
     audit_section = ""
     if audit_rows:
@@ -565,6 +597,7 @@ def render_html_report(
           <div class="kv"><div class="kv-label">Planned Stages</div><div class="kv-val">{html.escape(stages_str)}</div></div>
           <div class="kv"><div class="kv-label">Error Threshold</div><div class="kv-val">{html.escape(threshold_str)}</div></div>
           <div class="kv"><div class="kv-label">Final Status</div><div class="kv-val">{status_esc}</div></div>
+          <div class="kv"><div class="kv-label">Feature Health</div><div class="kv-val">{html.escape(health_summary)}</div></div>
         </div>
       </section>
       <section class="card">
@@ -622,6 +655,9 @@ def render_markdown_report(result: RolloutRunResult) -> str:
     ]
     if result.is_synthetic:
         lines.append("- **Data Source**: `SYNTHETIC DATA` (simulated identity traffic)")
+    if result.health_status is not None:
+        delivery = "webhook delivered" if result.health_webhook_sent else "webhook skipped/failed"
+        lines.append(f"- **Feature Health**: `{result.health_status}` ({delivery})")
     lines.extend(
         [
             "",

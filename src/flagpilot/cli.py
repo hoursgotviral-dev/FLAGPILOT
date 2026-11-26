@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -324,6 +325,9 @@ def _handle_run(args: argparse.Namespace) -> int:
             close_fn()
 
     print(f"[{SYNTHETIC_LABEL}] Rollout finished with status: {result.final_status}")
+    if result.health_status is not None:
+        delivery = "webhook delivered" if result.health_webhook_sent else "webhook skipped or failed"
+        print(f"Feature Health: {result.health_status} ({delivery})")
     save_run_result(result, args.run_out)
     audit_entries = load_audit_log(args.audit_log)
     save_html_report(result, args.report_out, audit_entries=audit_entries)
@@ -372,7 +376,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (
         ApprovalDeniedError,
         BootstrapError,
+        FileNotFoundError,
         FlagsmithAPIError,
+        json.JSONDecodeError,
         PlanValidationError,
         ValueError,
     ) as exc:
