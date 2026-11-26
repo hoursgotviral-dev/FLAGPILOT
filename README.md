@@ -15,19 +15,32 @@ FlagPilot orchestrates staged **% Split** (`PERCENTAGE_SPLIT`) rollouts on self-
 
 ## Architecture
 
+```mermaid
+flowchart LR
+  Req["Plain-English Request"] --> Plan["planner.py (offline)<br/>plan.json + plan.md"]
+  Plan --> Gate{"apply.py<br/>TTY APPROVE Gate"}
+  Gate -- "APPROVE" --> FS["Flagsmith % Split<br/>fsapi.py"]
+  FS --> Eval["Persistent Identities<br/>user_000..user_199"]
+  Eval --> Check{"Error Rate<br/>Check"}
+  Check -- "<= threshold" --> Gate
+  Check -- "> threshold" --> RB["Auto-Rollback<br/>+ UNHEALTHY Webhook"]
+  RB --> Artifacts["audit.log +<br/>reports/rollout.html"]
+  Check -- "Clean / Reset" --> Healthy["HEALTHY Webhook<br/>-> audit.log"]
+```
+
 ```text
   Plain-English Request / CLI (cli.py)
         |
         +--> planner.py ----------> plan.json + plan.md (offline, zero-key; optional LLM adapter boundary)
         |
-        +--> bootstrap.py --------> Zero-UI setup (superuser, org, project, env, keys, .env)
+        +--> bootstrap.py --------> Zero-UI setup (superuser, org, project, env, keys, health webhook, .env)
         |
-        +--> controller.py -------> audit.log (UTC decisions, no secrets)
+        +--> controller.py -------> audit.log (UTC decisions + feature_health events, no secrets)
         |       |
         |       +--> apply.py (TTY + exact "APPROVE" gate; refuses non-interactive)
         |       |       |
         |       |       v
-        |       |    fsapi.py [FlagsmithClient Protocol] --(Management REST API)--> Self-Hosted Flagsmith
+        |       |    fsapi.py [FlagsmithClient / HealthNotifier] --(REST API + Webhook)--> Self-Hosted Flagsmith
         |       |
         |       +--> simulator.py (persistent user_000..; SYNTHETIC DATA)
         |               |
@@ -92,6 +105,7 @@ During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when pr
 
 ```text
 .
+├── .github/workflows/ci.yml         # GitHub Actions CI (ruff + offline pytest on Python 3.11 & 3.13)
 ├── pyproject.toml                   # Python >=3.11 packaging, deps (requests, python-dotenv, flagsmith), pytest markers
 ├── docker-compose.yml               # Official self-hosted Flagsmith + Postgres compose stack
 ├── .env.example                     # Placeholder env vars (FLAGSMITH_API_URL, keys, project/feature/segment IDs)
@@ -136,5 +150,5 @@ During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when pr
 
 ## Development status
 
-- **Unit CI (`pytest -v` & `ruff check src tests`)**: `36` offline tests pass (`1` live test skipped unless `FLAGPILOT_LIVE_TEST=1`) and `ruff` passes with zero issues.
-- **Live Flagsmith integration (`FLAGPILOT_LIVE_TEST=1 pytest -m live -v`)**: Verified against live self-hosted Flagsmith `2.295.2` (`1 passed`), covering idempotent `bootstrap`, monotonic `1% -> 10% -> 50%` enrollment, automatic `0%` rollback on fault spike, Grafana Feature Health `UNHEALTHY`/`HEALTHY` transitions, `audit.log`, and static `reports/rollout.html`.
+- **Unit CI (`pytest -v` & `ruff check src tests` via `.github/workflows/ci.yml`)**: `38` offline tests pass (`1` live test skipped unless `FLAGPILOT_LIVE_TEST=1`) and `ruff` passes with zero issues across Python `3.11` and `3.13`.
+- **Live Flagsmith integration (`FLAGPILOT_LIVE_TEST=1 pytest -m live -v`)**: Verified against live self-hosted Flagsmith `2.295.2` (`1 passed`), covering idempotent `bootstrap`, monotonic `1% -> 10% -> 50%` enrollment, automatic `0%` rollback on fault spike, Grafana Feature Health `UNHEALTHY`/`HEALTHY` webhook delivery, `audit.log` recording, and static `reports/rollout.html`.

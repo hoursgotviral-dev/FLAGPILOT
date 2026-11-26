@@ -4,17 +4,17 @@
 
 FlagPilot is a deterministic terminal controller for staged feature flag rollouts on self-hosted Flagsmith. It separates offline planning and decision logic from all Flagsmith network I/O so every component can be unit-tested with fake clients and no Flagsmith write can occur without human approval.
 
-> **Note:** All Flagsmith HTTP and Python SDK calls in `src/flagpilot/fsapi.py` and `src/flagpilot/simulator.py` are marked **UNVERIFIED** until tested against a running local Flagsmith instance.
+> **Note:** HTTP and Python SDK integrations in `src/flagpilot/fsapi.py`, `src/flagpilot/bootstrap.py`, and `src/flagpilot/simulator.py` are verified live against self-hosted Flagsmith `2.295.2` (`tests/test_live_flagsmith.py`), while offline unit CI runs against Protocol-backed fakes and mocks.
 
 ## Components
 
-- **`types.py`**: Immutable frozen dataclasses (`Plan`, `Step`, `Decision`, `FlagEvaluation`, `StageMetrics`, `RolloutChange`, `StageOutcome`, `RolloutRunResult`) plus the `FlagsmithClient` and `FlagEvaluator` `Protocol` interfaces.
+- **`types.py`**: Immutable frozen dataclasses (`Plan`, `Step`, `Decision`, `FlagEvaluation`, `StageMetrics`, `RolloutChange`, `StageOutcome`, `RolloutRunResult`) plus the `FlagsmithClient`, `RolloutBackend`, `FlagEvaluator`, and `HealthNotifier` `Protocol` interfaces.
 - **`planner.py`**: Offline rule-based parser (`parse_plain_english_request`) and artifact writer (`plan.json`, `plan.md`). Imports neither `requests` nor `flagsmith`.
 - **`apply.py`**: Mandatory human-in-the-loop approval gate (`require_approval`, `ApprovedFlagsmithWriter`). Refuses non-interactive runs (`NonInteractiveError`), rejects any input other than exact `APPROVE`, and exposes no bypass flag.
-- **`fsapi.py`**: The sole home for Flagsmith Management REST API HTTP calls (`FlagsmithManagementClient`). Scrubs all keys from errors before raising `FlagsmithAPIError`. (**UNVERIFIED**)
-- **`simulator.py`**: The sole home for Flagsmith Python SDK calls (`FlagsmithSDKEvaluator`, **UNVERIFIED**), plus `OfflineFakeEvaluator`, persistent identity management (`user_000..`), and seeded `SYNTHETIC DATA` traffic simulation (`TrafficSimulator`).
-- **`controller.py`**: Executes stages (`[1, 10, 50, 100]` by default), waits the configured interval, evaluates observed error rate against `max_error_rate` (default `2%`), rolls back to the previous safe percentage (or `0%`) on breach, and appends UTC JSON lines to `audit.log` without secrets.
-- **`report.py`**: Combines `audit.log` and `reports/last_run.json` into a single static `reports/rollout.html` with inline CSS (light/dark mode), zero `<script>` tags, an inline SVG chart, `SYNTHETIC DATA` banner, and rollback reason banner.
+- **`fsapi.py`**: The sole home for Flagsmith Management REST API HTTP calls and fail-safe Grafana Feature Health Alertmanager webhook dispatch (`FlagsmithManagementClient`). Scrubs all keys and webhook URLs from errors and warnings before raising `FlagsmithAPIError`.
+- **`simulator.py`**: The sole home for Flagsmith Python SDK calls (`FlagsmithSDKEvaluator`), plus `OfflineFakeEvaluator`, persistent identity management (`user_000..`), and seeded `SYNTHETIC DATA` traffic simulation (`TrafficSimulator`).
+- **`controller.py`**: Executes stages (`[1, 10, 50, 100]` by default), waits the configured interval, evaluates observed error rate against `max_error_rate` (default `2%`), rolls back to the previous safe percentage (or `0%`) on breach, dispatches fail-safe Feature Health webhooks (`UNHEALTHY` / `HEALTHY`), and appends UTC JSON lines to `audit.log` without secrets.
+- **`report.py`**: Combines `audit.log` and `reports/last_run.json` into a single static `reports/rollout.html` with inline CSS (light/dark mode), zero `<script>` tags, an inline SVG chart, `SYNTHETIC DATA` banner, Feature Health summary/timeline, and rollback reason banner.
 
 ## Rollout Data Flow
 
