@@ -242,3 +242,89 @@ def test_cli_missing_file_returns_clean_error(
     code = main(["apply", str(missing)])
     assert code == 1
     assert "Error:" in capsys.readouterr().err
+
+
+def test_cli_run_upfront_approve_and_step_approve_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI run executes spike+0% rollback with 1 upfront APPROVE, or pauses with --step-approve."""
+    monkeypatch.setenv("FLAGSMITH_API_URL", "http://localhost:8000/api/v1")
+    monkeypatch.setenv("FLAGSMITH_ADMIN_KEY", "dummy-admin")
+
+    # Default (upfront single APPROVE) with --rollback-to-zero
+    client1 = _FakeBackend()
+    run_out = tmp_path / "last_run.json"
+    html_out = tmp_path / "rollout.html"
+    stdin1 = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin1, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin1)
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=client1):
+        code1 = main(
+            [
+                "run",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--spike-rate",
+                "0.25",
+                "--spike-threshold-pct",
+                "25",
+                "--rollback-to-zero",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(tmp_path / "audit1.log"),
+                "--run-out",
+                str(run_out),
+                "--report-out",
+                str(html_out),
+            ]
+        )
+    assert code1 == 1
+    assert client1.calls == [("apply", 1), ("apply", 10), ("apply", 50), ("rollback", 0)]
+    out1 = capsys.readouterr().out
+    assert "Post-rollback verification: 0/200 exposed identities after rollback to 0%" in out1
+
+    run_json = json.loads(run_out.read_text(encoding="utf-8"))
+    assert run_json["monotonic_enrollment"]["all_monotonic"] is True
+    assert run_json["outcomes"][1]["retained_from_previous_stage"]["monotonic"] is True
+    assert run_json["post_rollback_verification"]["exposed_count"] == 0
+    assert run_json["post_rollback_verification"]["sample_count"] == 200
+    assert run_json["post_rollback_verification"]["verified"] is True
+
+    html_doc = html_out.read_text(encoding="utf-8")
+    assert "0/200 exposed identities after rollback to 0%" in html_doc
+    assert "stayed enrolled" in html_doc
+
+    # Opt-in --step-approve with only 1 APPROVE pauses at stage 2
+    client2 = _FakeBackend()
+    stdin2 = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin2, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin2)
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=client2):
+        code2 = main(
+            [
+                "run",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--step-approve",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(tmp_path / "audit2.log"),
+                "--run-out",
+                str(tmp_path / "run2.json"),
+                "--report-out",
+                str(tmp_path / "html2.html"),
+            ]
+        )
+    assert code2 == 1
+    assert client2.calls == [("apply", 1)]
+    capsys.readouterr()

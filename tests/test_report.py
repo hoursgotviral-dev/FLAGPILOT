@@ -10,6 +10,7 @@ from flagpilot.cli import main
 from flagpilot.controller import RolloutController, execute_manual_rollback
 from flagpilot.planner import build_plan
 from flagpilot.report import load_run_result, render_markdown_report, save_run_result
+from flagpilot.simulator import OfflineFakeEvaluator, TrafficSimulator, make_error_rate_fn
 from flagpilot.types import Plan, RolloutChange, StageMetrics, Step
 
 
@@ -188,4 +189,67 @@ def test_report_surfaces_feature_health_status_and_transition(tmp_path: Path) ->
     assert "UNHEALTHY (webhook delivered) → HEALTHY (webhook delivered)" in html_doc
     assert "Flagsmith Feature Health UNHEALTHY" in html_doc
     assert "Flagsmith Feature Health HEALTHY" in html_doc
+
+
+def test_report_includes_monotonicity_and_post_rollback_verification(tmp_path: Path) -> None:
+    """last_run.json and rollout.html capture monotonic enrollment proof and 0/200 verification."""
+    evaluator = OfflineFakeEvaluator()
+    sim = TrafficSimulator(
+        evaluator,
+        user_count=200,
+        seed=42,
+        baseline_rate=0.005,
+        error_rate_fn=make_error_rate_fn(
+            baseline_rate=0.005,
+            spike_rate=0.25,
+            spike_threshold_pct=25.0,
+        ),
+    )
+
+    class _Provider:
+        def collect(self, plan: Plan, step: Step) -> StageMetrics:
+            evaluator.set_percentage(step.percentage)
+            return sim.run_round(plan.feature_name).to_stage_metrics(step.percentage)
+
+        def verify_rollback(self, plan: Plan, target_percentage: int) -> StageMetrics:
+            evaluator.set_percentage(target_percentage)
+            return sim.run_round(plan.feature_name).to_stage_metrics(target_percentage)
+
+    writer = ApprovedFlagsmithWriter(
+        _FakeRolloutBackend(),
+        input_stream=io.StringIO("APPROVE\n"),
+        output_stream=io.StringIO(),
+        is_tty=True,
+    )
+    audit_log = tmp_path / "audit.log"
+    result = RolloutController(
+        writer,
+        _Provider(),
+        audit_log_path=audit_log,
+        output_stream=io.StringIO(),
+        rollback_to_zero=True,
+    ).run(build_plan("checkout_v2", "Development"), is_synthetic=True)
+
+    run_path = tmp_path / "last_run.json"
+    html_path = tmp_path / "rollout.html"
+    save_run_result(result, run_path)
+    reloaded = load_run_result(run_path)
+    assert reloaded == result
+
+    main(
+        [
+            "report",
+            "--input",
+            str(run_path),
+            "--audit-log",
+            str(audit_log),
+            "--out",
+            str(html_path),
+        ]
+    )
+    html_doc = html_path.read_text(encoding="utf-8")
+    assert "Monotonic Enrollment" in html_doc
+    assert "Verified (100% retained across 2 step-up(s))" in html_doc
+    assert "Verified: 0/200 exposed identities after rollback to 0%" in html_doc
+    assert "Zero-Exposure Confirmed" in html_doc
 

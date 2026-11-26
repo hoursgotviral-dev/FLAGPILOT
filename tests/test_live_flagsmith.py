@@ -86,11 +86,16 @@ def test_live_end_to_end_rollout_monotonicity_and_rollback(tmp_path: Path) -> No
             exposed_by_stage[step.percentage] = set(round_result.exposed_identities)
             return round_result.to_stage_metrics(step.percentage)
 
+        def verify_rollback(self, active_plan: Plan, target_percentage: int) -> StageMetrics:
+            _, live_pct = _get_live_segment_info()
+            assert live_pct == str(target_percentage)
+            return simulator.run_round(active_plan.feature_name).to_stage_metrics(target_percentage)
+
     audit_log = tmp_path / "audit.log"
     out = io.StringIO()
     writer = ApprovedFlagsmithWriter(
         client,
-        input_stream=io.StringIO("APPROVE\n" * 4),
+        input_stream=io.StringIO("APPROVE\n"),
         output_stream=io.StringIO(),
         is_tty=True,
     )
@@ -116,13 +121,21 @@ def test_live_end_to_end_rollout_monotonicity_and_rollback(tmp_path: Path) -> No
         assert exposed_by_stage[1].issubset(exposed_by_stage[10])
         assert exposed_by_stage[10].issubset(exposed_by_stage[50])
         assert len(exposed_by_stage[50]) > len(exposed_by_stage[10]) >= len(exposed_by_stage[1])
+        assert result.outcomes[1].retained_from_previous_stage is not None
+        assert result.outcomes[1].retained_from_previous_stage.monotonic is True
+        assert result.outcomes[2].retained_from_previous_stage is not None
+        assert result.outcomes[2].retained_from_previous_stage.monotonic is True
 
-        # Verify rollback persisted in live Flagsmith API and exposure is 0%
+        # Verify rollback persisted in live Flagsmith API and controller confirmed 0/200 exposure
         seg_id, live_pct_after = _get_live_segment_info()
         assert live_pct_after == "0"
         state = client.get_state("checkout_v2", segment_id=seg_id)
         assert state["default_state"]["enabled"] is False
         assert state["segment_override"]["enabled"] is False
+        assert result.post_rollback_verification is not None
+        assert result.post_rollback_verification.verified is True
+        assert result.post_rollback_verification.exposed_count == 0
+        assert result.post_rollback_verification.sample_count == 200
 
         post_rollback_round = simulator.run_round("checkout_v2")
         assert post_rollback_round.exposed_count == 0
@@ -162,17 +175,24 @@ def test_live_end_to_end_rollout_monotonicity_and_rollback(tmp_path: Path) -> No
             "advance",
             "advance",
             "rollback",
+            "post_rollback_verification",
             "feature_health",
         ]
         assert entries[2]["old_percentage"] == 50
         assert entries[2]["new_percentage"] == 0
-        assert entries[3]["health_status"] == "UNHEALTHY"
-        assert entries[3]["webhook_sent"] is True
+        assert entries[3]["verified"] is True
+        assert entries[3]["exposed_count"] == 0
+        assert entries[4]["health_status"] == "UNHEALTHY"
+        assert entries[4]["webhook_sent"] is True
 
         last_run_path = tmp_path / "reports" / "last_run.json"
         html_path = tmp_path / "reports" / "rollout.html"
         save_run_result(result, last_run_path)
         save_html_report(result, html_path, audit_entries=load_audit_log(audit_log))
+
+        last_run_data = json.loads(last_run_path.read_text(encoding="utf-8"))
+        assert last_run_data["monotonic_enrollment"]["all_monotonic"] is True
+        assert last_run_data["post_rollback_verification"]["verified"] is True
 
         html_text = html_path.read_text(encoding="utf-8")
         assert cfg.admin_key not in html_text
@@ -180,6 +200,7 @@ def test_live_end_to_end_rollout_monotonicity_and_rollback(tmp_path: Path) -> No
         assert "SYNTHETIC DATA" in html_text
         assert "ROLLBACK TRIGGERED to 0%" in html_text
         assert "UNHEALTHY (webhook delivered)" in html_text
+        assert "0/200 exposed identities after rollback to 0%" in html_text
         assert "<svg " in html_text
     finally:
         evaluator.close()

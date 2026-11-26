@@ -449,3 +449,114 @@ def test_controller_and_manual_rollback_emit_health_notifications(tmp_path: Path
     manual_rows = [json.loads(line) for line in (tmp_path / "audit3.log").read_text().splitlines()]
     assert manual_rows[-1]["action"] == "feature_health"
     assert manual_rows[-1]["health_status"] == "HEALTHY"
+
+
+def test_controller_upfront_approve_non_interactive_abort_and_step_approve_opt_in(
+    tmp_path: Path,
+) -> None:
+    """Default run requires 1 upfront APPROVE (no mid-incident prompts); --step-approve opts into per-step prompts."""
+    # 1. Non-interactive TTY=False aborts before touching Flagsmith
+    client_abort = _FakeFlagsmithClient()
+    eval_abort = OfflineFakeEvaluator()
+    sim_abort = TrafficSimulator(eval_abort, user_count=200, seed=42)
+    out_abort = io.StringIO()
+    res_abort = RolloutController(
+        ApprovedFlagsmithWriter(
+            client_abort,
+            input_stream=io.StringIO("APPROVE\n"),
+            output_stream=out_abort,
+            is_tty=False,
+        ),
+        _SimulatorSignalProvider(eval_abort, sim_abort),
+        audit_log_path=tmp_path / "abort.log",
+        output_stream=out_abort,
+        rollback_to_zero=True,
+    ).run(build_plan("checkout_v2", "Development"))
+    assert res_abort.final_status == "aborted"
+    assert client_abort.percentage_history == []
+
+    # 2. Single upfront APPROVE runs 1->10->50 + automatic 0% rollback without pausing mid-incident
+    client_upfront = _FakeFlagsmithClient()
+    eval_upfront = OfflineFakeEvaluator()
+    sim_upfront = TrafficSimulator(
+        eval_upfront,
+        user_count=200,
+        seed=42,
+        baseline_rate=0.005,
+        error_rate_fn=make_error_rate_fn(
+            baseline_rate=0.005,
+            spike_rate=0.25,
+            spike_threshold_pct=25.0,
+        ),
+    )
+
+    class _VerifyingSignalProvider(_SimulatorSignalProvider):
+        def verify_rollback(self, plan: Plan, target_percentage: int) -> StageMetrics:
+            self._evaluator.set_percentage(target_percentage)
+            return self._sim.run_round(plan.feature_name).to_stage_metrics(target_percentage)
+
+    gate_out = io.StringIO()
+    ctrl_out = io.StringIO()
+    audit_log = tmp_path / "upfront.log"
+    res_upfront = RolloutController(
+        ApprovedFlagsmithWriter(
+            client_upfront,
+            input_stream=io.StringIO("APPROVE\n"),
+            output_stream=gate_out,
+            is_tty=True,
+        ),
+        _VerifyingSignalProvider(eval_upfront, sim_upfront),
+        audit_log_path=audit_log,
+        output_stream=ctrl_out,
+        rollback_to_zero=True,
+    ).run(build_plan("checkout_v2", "Development"))
+
+    assert res_upfront.final_status == "rolled_back"
+    assert res_upfront.rollback_to_percentage == 0
+    assert client_upfront.percentage_history == [1, 10, 50, 0]
+    assert "Rollout schedule: 1% -> 10% -> 50% -> 100%" in gate_out.getvalue()
+    assert "auto-rollback to 0%" in gate_out.getvalue()
+
+    # Monotonic enrollment proof recorded across step-ups (1%->10%, 10%->50%)
+    assert res_upfront.outcomes[0].retained_from_previous_stage is None
+    m_1_10 = res_upfront.outcomes[1].retained_from_previous_stage
+    m_10_50 = res_upfront.outcomes[2].retained_from_previous_stage
+    assert m_1_10 is not None and m_1_10.monotonic is True
+    assert m_1_10.retained_count == m_1_10.previous_exposed_count
+    assert m_10_50 is not None and m_10_50.monotonic is True
+    assert m_10_50.retained_count == m_10_50.previous_exposed_count
+    assert "10% users stayed enrolled at 50%" in m_10_50.summary
+    assert f"Monotonicity check: {m_10_50.summary}" in ctrl_out.getvalue()
+
+    # Post-rollback 0/200 verification tick recorded
+    verif = res_upfront.post_rollback_verification
+    assert verif is not None
+    assert verif.target_percentage == 0
+    assert verif.exposed_count == 0
+    assert verif.sample_count == 200
+    assert verif.verified is True
+    assert verif.summary == "0/200 exposed identities after rollback to 0%"
+
+    rows = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()]
+    assert rows[1]["retained_from_previous_stage"]["monotonic"] is True
+    assert rows[-1]["action"] == "post_rollback_verification"
+    assert rows[-1]["verified"] is True
+
+    # 3. Opt-in step_approve=True prompts before every stage (1 APPROVE pauses at stage 2)
+    client_step = _FakeFlagsmithClient()
+    eval_step = OfflineFakeEvaluator()
+    sim_step = TrafficSimulator(eval_step, user_count=200, seed=42)
+    res_step = RolloutController(
+        ApprovedFlagsmithWriter(
+            client_step,
+            input_stream=io.StringIO("APPROVE\n"),
+            output_stream=io.StringIO(),
+            is_tty=True,
+        ),
+        _SimulatorSignalProvider(eval_step, sim_step),
+        audit_log_path=tmp_path / "step.log",
+        output_stream=io.StringIO(),
+        step_approve=True,
+    ).run(build_plan("checkout_v2", "Development"))
+    assert res_step.final_status == "paused"
+    assert client_step.percentage_history == [1]
