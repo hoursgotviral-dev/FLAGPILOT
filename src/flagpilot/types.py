@@ -189,3 +189,20 @@ class FlagEvaluator(Protocol):
     def evaluate(self, identifier: str, feature_name: str) -> FlagEvaluation:
         """Evaluate a feature flag for a persistent identity."""
         ...
+
+
+@runtime_checkable
+class HealthNotifier(Protocol):
+    """Fail-safe notifier for Flagsmith Feature Health webhook events."""
+
+    def notify_health(
+        self,
+        feature_name: str,
+        environment: str,
+        *,
+        status: Literal["firing", "resolved"],
+        summary: str,
+        description: str,
+    ) -> bool:
+        """Send an Alertmanager-format health event; never raises on failure."""
+        ...

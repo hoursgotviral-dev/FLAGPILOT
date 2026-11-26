@@ -5,14 +5,18 @@ Endpoints verified against local self-hosted Flagsmith 2.295.2.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
 import requests
 from dotenv import load_dotenv
 
 from flagpilot.types import Plan, RolloutChange
+
+logger = logging.getLogger(__name__)
 
 
 class FlagsmithAPIError(RuntimeError):
@@ -54,6 +58,7 @@ class FlagsmithConfig:
     admin_key: str = field(repr=False)
     environment_key: str | None = field(default=None, repr=False)
     project_id: int | None = None
+    health_webhook_url: str | None = field(default=None, repr=False)
     timeout_seconds: float = 10.0
 
     @classmethod
@@ -68,6 +73,7 @@ class FlagsmithConfig:
             or os.environ.get("FLAGSMITH_CLIENT_KEY", "").strip()
             or None
         )
+        health_webhook_url = os.environ.get("FLAGSMITH_HEALTH_WEBHOOK_URL", "").strip() or None
         raw_project_id = os.environ.get("FLAGSMITH_PROJECT_ID", "").strip()
         project_id: int | None = None
         if raw_project_id:
@@ -86,6 +92,7 @@ class FlagsmithConfig:
             admin_key=admin_key,
             environment_key=environment_key,
             project_id=project_id,
+            health_webhook_url=health_webhook_url,
         )
 
 
@@ -108,7 +115,13 @@ class FlagsmithManagementClient:
         self._base_url = f"{self._root_url}api/v1/"
         self._timeout = config.timeout_seconds
         self._secrets: tuple[str, ...] = tuple(
-            s for s in (config.admin_key, config.environment_key or "") if s
+            s
+            for s in (
+                config.admin_key,
+                config.environment_key or "",
+                config.health_webhook_url or "",
+            )
+            if s
         )
         self._session = session or requests.Session()
         self._session.headers.update(
@@ -555,3 +568,107 @@ class FlagsmithManagementClient:
     def rollback(self, plan: Plan) -> RolloutChange:
         """Roll back the staged rollout segment to ``plan.rollback_percentage`` (default 0%)."""
         return self.apply_stage(plan, plan.rollback_percentage)
+
+    def get_feature_health_events(self, project_id: int | None = None) -> list[dict[str, Any]]:
+        """List Feature Health events recorded for a project."""
+        resolved_project = self.resolve_project_id(project_id)
+        payload = self._request("GET", f"projects/{resolved_project}/feature-health/events/")
+        return self._extract_results(payload)
+
+    def build_alertmanager_payload(
+        self,
+        feature_name: str,
+        environment: str,
+        *,
+        status: Literal["firing", "resolved"],
+        summary: str,
+        description: str,
+    ) -> dict[str, Any]:
+        """Build an Alertmanager-compatible payload matching Flagsmith GrafanaWebhookData."""
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+        if status == "firing":
+            starts_at = now_iso
+            ends_at = "0001-01-01T00:00:00Z"
+        else:
+            starts_at = (now - timedelta(seconds=1)).isoformat()
+            ends_at = now_iso
+
+        labels = {
+            "alertname": "FlagPilotErrorRateSpike",
+            "flagsmith_feature": feature_name,
+            "flagsmith_environment": environment,
+        }
+        annotations = {
+            "summary": summary,
+            "description": description,
+        }
+        return {
+            "status": status,
+            "alerts": [
+                {
+                    "status": status,
+                    "labels": labels,
+                    "annotations": annotations,
+                    "startsAt": starts_at,
+                    "endsAt": ends_at,
+                    "generatorURL": self._root_url,
+                    "fingerprint": f"flagpilot-{feature_name}-{environment}",
+                }
+            ],
+            "commonLabels": labels,
+            "commonAnnotations": annotations,
+        }
+
+    def notify_health(
+        self,
+        feature_name: str,
+        environment: str,
+        *,
+        status: Literal["firing", "resolved"],
+        summary: str,
+        description: str,
+    ) -> bool:
+        """Fail-safe POST of Alertmanager JSON to ``FLAGSMITH_HEALTH_WEBHOOK_URL``."""
+        webhook_url = (
+            self._config.health_webhook_url
+            or os.environ.get("FLAGSMITH_HEALTH_WEBHOOK_URL", "").strip()
+        )
+        if not webhook_url:
+            logger.warning(
+                "FLAGSMITH_HEALTH_WEBHOOK_URL is not configured; skipping Flagsmith Feature Health (%s) notification.",
+                status,
+            )
+            return False
+
+        payload = self.build_alertmanager_payload(
+            feature_name,
+            environment,
+            status=status,
+            summary=summary,
+            description=description,
+        )
+        secrets = (*self._secrets, webhook_url)
+        try:
+            response = self._session.request(
+                method="POST",
+                url=webhook_url,
+                json=payload,
+                timeout=self._timeout,
+            )
+            if not response.ok:
+                logger.warning(
+                    "Flagsmith Feature Health webhook (%s) returned HTTP %s: %s",
+                    status,
+                    response.status_code,
+                    _sanitize_secrets(response.text or "", secrets),
+                )
+                return False
+        except requests.RequestException as exc:
+            logger.warning(
+                "Flagsmith Feature Health webhook (%s) unreachable: %s",
+                status,
+                _sanitize_secrets(str(exc), secrets),
+            )
+            return False
+        return True

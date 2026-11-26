@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, TextIO
+from typing import Literal, Protocol, TextIO
 
 from flagpilot.apply import ApprovalDeniedError, ApprovedFlagsmithWriter
 from flagpilot.types import (
     Decision,
+    HealthNotifier,
     Plan,
     RolloutChange,
     RolloutRunResult,
@@ -20,6 +22,8 @@ from flagpilot.types import (
     StageOutcome,
     Step,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class StageSignalProvider(Protocol):
@@ -132,6 +136,29 @@ def evaluate_stage(
     )
 
 
+def _safe_notify_health(
+    notifier: HealthNotifier | None,
+    feature_name: str,
+    environment: str,
+    *,
+    status: Literal["firing", "resolved"],
+    summary: str,
+    description: str,
+) -> None:
+    if notifier is None or not isinstance(notifier, HealthNotifier):
+        return
+    try:
+        notifier.notify_health(
+            feature_name,
+            environment,
+            status=status,
+            summary=summary,
+            description=description,
+        )
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        logger.warning("Feature Health notification (%s) failed: %s", status, exc)
+
+
 class RolloutController:
     """Executes staged Flagsmith rollouts gated by human approval and error thresholds."""
 
@@ -145,6 +172,7 @@ class RolloutController:
         audit_log_path: Path | None = Path("audit.log"),
         output_stream: TextIO | None = None,
         rollback_to_zero: bool = False,
+        health_notifier: HealthNotifier | None = None,
     ) -> None:
         if interval_seconds < 0:
             raise ValueError("interval_seconds must be >= 0.")
@@ -155,6 +183,7 @@ class RolloutController:
         self._audit_log_path = audit_log_path
         self._output_stream = output_stream if output_stream is not None else sys.stdout
         self._rollback_to_zero = rollback_to_zero
+        self._health_notifier = health_notifier
 
     def _log_decision(
         self,
@@ -289,6 +318,14 @@ class RolloutController:
                         rollback_applied=False,
                         is_synthetic=is_synthetic,
                     )
+                _safe_notify_health(
+                    self._health_notifier,
+                    plan.feature_name,
+                    plan.environment,
+                    status="firing",
+                    summary=f"FlagPilot rollback triggered at {step.percentage}% -> {rollback_target}%",
+                    description=decision.reason,
+                )
                 return RolloutRunResult(
                     plan=plan,
                     final_status="rolled_back",
@@ -300,6 +337,14 @@ class RolloutController:
 
             previous_safe_percentage = step.percentage
 
+        _safe_notify_health(
+            self._health_notifier,
+            plan.feature_name,
+            plan.environment,
+            status="resolved",
+            summary=f"FlagPilot rollout completed for {plan.feature_name}",
+            description=f"All {len(steps)} rollout stage(s) passed within threshold.",
+        )
         return RolloutRunResult(
             plan=plan,
             final_status="completed",
@@ -317,6 +362,7 @@ def execute_manual_rollback(
     reason: str = "manual rollback",
     audit_log_path: Path | None = Path("audit.log"),
     output_stream: TextIO | None = None,
+    health_notifier: HealthNotifier | None = None,
 ) -> RolloutChange:
     """Roll back a plan to 0% through the approval gate and log to ``audit.log``."""
     out = output_stream if output_stream is not None else sys.stdout
@@ -329,6 +375,14 @@ def execute_manual_rollback(
         old_percentage=old_percentage,
         new_percentage=0,
         reason=reason,
+    )
+    _safe_notify_health(
+        health_notifier,
+        plan.feature_name,
+        plan.environment,
+        status="resolved",
+        summary=f"FlagPilot manual rollback/reset for {plan.feature_name}",
+        description=reason,
     )
     out.write(
         f"Rolled back {change.feature_name} ({change.environment}) from "

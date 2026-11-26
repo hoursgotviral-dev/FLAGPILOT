@@ -46,7 +46,7 @@ from flagpilot.simulator import (
     TrafficSimulator,
     make_error_rate_fn,
 )
-from flagpilot.types import FlagEvaluator, Plan, StageMetrics, Step
+from flagpilot.types import FlagEvaluator, HealthNotifier, Plan, StageMetrics, Step
 
 SUBCOMMANDS = ("bootstrap", "plan", "apply", "run", "rollback", "report")
 DEFAULT_MAX_ERROR_RATE = 0.02
@@ -314,6 +314,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         interval_seconds=args.interval,
         audit_log_path=args.audit_log,
         rollback_to_zero=args.rollback_to_zero,
+        health_notifier=backend if isinstance(backend, HealthNotifier) else None,
     )
     try:
         result = controller.run(plan, is_synthetic=True)
@@ -340,6 +341,7 @@ def _handle_rollback(args: argparse.Namespace) -> int:
         old_percentage=args.old_percentage,
         reason=args.reason,
         audit_log_path=args.audit_log,
+        health_notifier=backend if isinstance(backend, HealthNotifier) else None,
     )
     return 0
 
