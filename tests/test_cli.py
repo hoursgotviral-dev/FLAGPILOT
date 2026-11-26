@@ -444,3 +444,56 @@ def test_cli_plan_and_run_rich_and_plain_flags(
     assert "\x1b[" not in run_plain_out
     assert "┃" not in run_plain_out
     assert "VERIFIED 0/200 EXPOSED" in run_plain_out
+
+
+def test_cli_plan_use_llm_routes_through_adapter_and_keeps_approve_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Default plan never invokes LLM; --use-llm calls plan_with_llm and apply still enforces APPROVE."""
+    monkeypatch.delenv("FLAGPILOT_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    # 1. Default zero-key path does NOT invoke plan_with_llm
+    with patch("flagpilot.cli.plan_with_llm") as mock_llm:
+        default_code = main(
+            [
+                "plan",
+                "roll out checkout_v2 to 10% in Development, pause if errors exceed 2%",
+                "--out-dir",
+                str(tmp_path / "default"),
+            ]
+        )
+    assert default_code == 0
+    mock_llm.assert_not_called()
+
+    # 2. --use-llm invokes plan_with_llm, writes plan.json/plan.md without Flagsmith calls,
+    #    and apply STILL refuses non-interactive writes (mandatory APPROVE gate preserved).
+    llm_plan = build_plan("ai_checkout", "Development", stages=(1, 25, 100), max_error_rate=0.01)
+    llm_dir = tmp_path / "llm"
+    with patch("flagpilot.cli.plan_with_llm", return_value=llm_plan) as mock_llm:
+        llm_code = main(
+            [
+                "plan",
+                "Canary ai_checkout to 100% in Development with strict 1% safety",
+                "--use-llm",
+                "--out-dir",
+                str(llm_dir),
+            ]
+        )
+    assert llm_code == 0
+    mock_llm.assert_called_once()
+    assert (llm_dir / "plan.json").exists()
+    assert (llm_dir / "plan.md").exists()
+    assert "Exact API Calls That Would Run" in (llm_dir / "plan.md").read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("APPROVE\n"))
+    fake_backend = _FakeBackend()
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=fake_backend):
+        apply_code = main(["apply", str(llm_dir / "plan.json")])
+    assert apply_code == 1
+    assert fake_backend.calls == []
+    assert "non-interactive" in capsys.readouterr().err.lower()
