@@ -156,10 +156,18 @@ def test_live_end_to_end_rollout_monotonicity_and_rollback(tmp_path: Path) -> No
         # Verify audit.log and HTML report artifacts without leaking secrets
         audit_text = audit_log.read_text(encoding="utf-8")
         assert cfg.admin_key not in audit_text
+        assert cfg.health_webhook_url not in audit_text
         entries = [json.loads(line) for line in audit_text.splitlines() if line.strip()]
-        assert [e["action"] for e in entries] == ["advance", "advance", "rollback"]
-        assert entries[-1]["old_percentage"] == 50
-        assert entries[-1]["new_percentage"] == 0
+        assert [e["action"] for e in entries] == [
+            "advance",
+            "advance",
+            "rollback",
+            "feature_health",
+        ]
+        assert entries[2]["old_percentage"] == 50
+        assert entries[2]["new_percentage"] == 0
+        assert entries[3]["health_status"] == "UNHEALTHY"
+        assert entries[3]["webhook_sent"] is True
 
         last_run_path = tmp_path / "reports" / "last_run.json"
         html_path = tmp_path / "reports" / "rollout.html"
@@ -168,8 +176,10 @@ def test_live_end_to_end_rollout_monotonicity_and_rollback(tmp_path: Path) -> No
 
         html_text = html_path.read_text(encoding="utf-8")
         assert cfg.admin_key not in html_text
+        assert cfg.health_webhook_url not in html_text
         assert "SYNTHETIC DATA" in html_text
         assert "ROLLBACK TRIGGERED to 0%" in html_text
+        assert "UNHEALTHY (webhook delivered)" in html_text
         assert "<svg " in html_text
     finally:
         evaluator.close()

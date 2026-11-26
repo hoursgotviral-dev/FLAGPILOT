@@ -7,9 +7,9 @@ from pathlib import Path
 
 from flagpilot.apply import ApprovedFlagsmithWriter
 from flagpilot.cli import main
-from flagpilot.controller import RolloutController
+from flagpilot.controller import RolloutController, execute_manual_rollback
 from flagpilot.planner import build_plan
-from flagpilot.report import save_run_result
+from flagpilot.report import load_run_result, render_markdown_report, save_run_result
 from flagpilot.types import Plan, RolloutChange, StageMetrics, Step
 
 
@@ -112,4 +112,80 @@ def test_report_subcommand_generates_static_html_from_fake_run_and_audit_log(
     assert "<svg " in html_doc
     assert "<polyline" in html_doc
     assert "+00:00" in html_doc
+    assert "Feature Health" in html_doc
+
+
+def test_report_surfaces_feature_health_status_and_transition(tmp_path: Path) -> None:
+    """Saved run JSON, Markdown, and HTML report show Feature Health status and recovery."""
+    plan = build_plan("checkout_v2", "Development", max_error_rate=0.02)
+    writer = ApprovedFlagsmithWriter(
+        _FakeRolloutBackend(),
+        input_stream=io.StringIO("APPROVE\n" * 4),
+        output_stream=io.StringIO(),
+        is_tty=True,
+    )
+    audit_log = tmp_path / "audit.log"
+
+    class _FakeNotifier:
+        def notify_health(
+            self,
+            feature_name: str,
+            environment: str,
+            *,
+            status: str,
+            summary: str,
+            description: str,
+        ) -> bool:
+            return True
+
+    result = RolloutController(
+        writer,
+        _FakeSpikeSignal(),
+        audit_log_path=audit_log,
+        output_stream=io.StringIO(),
+        health_notifier=_FakeNotifier(),
+    ).run(plan, is_synthetic=True)
+    assert result.health_status == "UNHEALTHY"
+    assert result.health_webhook_sent is True
+
+    last_run_path = tmp_path / "last_run.json"
+    save_run_result(result, last_run_path)
+    loaded = load_run_result(last_run_path)
+    assert loaded.health_status == "UNHEALTHY"
+    assert loaded.health_webhook_sent is True
+
+    md = render_markdown_report(loaded)
+    assert "UNHEALTHY" in md
+
+    out_html = tmp_path / "rollout.html"
+    # Simulate follow-up manual reset entry in audit.log marking feature HEALTHY again
+    execute_manual_rollback(
+        ApprovedFlagsmithWriter(
+            _FakeRolloutBackend(),
+            input_stream=io.StringIO("APPROVE\n"),
+            output_stream=io.StringIO(),
+            is_tty=True,
+        ),
+        plan,
+        old_percentage=10,
+        reason="demo cleanup",
+        audit_log_path=audit_log,
+        output_stream=io.StringIO(),
+        health_notifier=_FakeNotifier(),
+    )
+    main(
+        [
+            "report",
+            "--input",
+            str(last_run_path),
+            "--audit-log",
+            str(audit_log),
+            "--out",
+            str(out_html),
+        ]
+    )
+    html_doc = out_html.read_text(encoding="utf-8")
+    assert "UNHEALTHY (webhook delivered) → HEALTHY (webhook delivered)" in html_doc
+    assert "Flagsmith Feature Health UNHEALTHY" in html_doc
+    assert "Flagsmith Feature Health HEALTHY" in html_doc
 

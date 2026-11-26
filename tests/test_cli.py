@@ -231,3 +231,14 @@ def test_cli_bootstrap_subcommand(tmp_path: Path) -> None:
     with patch("flagpilot.cli.bootstrap_flagsmith", side_effect=BootstrapError("boom")):
         err_code = main(["bootstrap", "--env-file", str(env_file)])
     assert err_code == 1
+
+
+def test_cli_missing_file_returns_clean_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Missing input files return exit code 1 with concise Error output instead of traceback."""
+    missing = tmp_path / "does_not_exist.json"
+    code = main(["apply", str(missing)])
+    assert code == 1
+    assert "Error:" in capsys.readouterr().err

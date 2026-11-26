@@ -379,11 +379,17 @@ def test_controller_and_manual_rollback_emit_health_notifications(tmp_path: Path
     res_fail = ctrl_fail.run(build_plan("checkout_v2", "Development"))
     assert res_fail.final_status == "rolled_back"
     assert res_fail.rollback_to_percentage == 0
+    assert res_fail.health_status == "UNHEALTHY"
+    assert res_fail.health_webhook_sent is False
     assert len(firing_notifier.calls) == 1
     assert firing_notifier.calls[0]["status"] == "firing"
     assert firing_notifier.calls[0]["feature_name"] == "checkout_v2"
     assert firing_notifier.calls[0]["environment"] == "Development"
     assert "2.00%" in firing_notifier.calls[0]["description"]
+    fail_rows = [json.loads(line) for line in (tmp_path / "audit1.log").read_text().splitlines()]
+    assert fail_rows[-1]["action"] == "feature_health"
+    assert fail_rows[-1]["health_status"] == "UNHEALTHY"
+    assert fail_rows[-1]["webhook_sent"] is False
 
     # 2. Clean rollout completion -> 'resolved'
     client_ok = _FakeFlagsmithClient()
@@ -412,10 +418,17 @@ def test_controller_and_manual_rollback_emit_health_notifications(tmp_path: Path
     )
     res_ok = ctrl_ok.run(build_plan("checkout_v2", "Development"))
     assert res_ok.final_status == "completed"
+    assert res_ok.health_status == "HEALTHY"
+    assert res_ok.health_webhook_sent is True
     assert [c["status"] for c in resolved_notifier.calls] == ["resolved"]
+    ok_rows = [json.loads(line) for line in (tmp_path / "audit2.log").read_text().splitlines()]
+    assert ok_rows[-1]["action"] == "feature_health"
+    assert ok_rows[-1]["health_status"] == "HEALTHY"
+    assert ok_rows[-1]["webhook_sent"] is True
 
     # 3. Manual rollback/reset -> 'resolved'
     manual_notifier = _RecordingHealthNotifier()
+    manual_out = io.StringIO()
     writer_manual = ApprovedFlagsmithWriter(
         client_ok,
         input_stream=io.StringIO("APPROVE\n"),
@@ -428,7 +441,11 @@ def test_controller_and_manual_rollback_emit_health_notifications(tmp_path: Path
         old_percentage=100,
         reason="manual reset",
         audit_log_path=tmp_path / "audit3.log",
-        output_stream=io.StringIO(),
+        output_stream=manual_out,
         health_notifier=manual_notifier,
     )
     assert [c["status"] for c in manual_notifier.calls] == ["resolved"]
+    assert "Feature Health: HEALTHY (webhook delivered)" in manual_out.getvalue()
+    manual_rows = [json.loads(line) for line in (tmp_path / "audit3.log").read_text().splitlines()]
+    assert manual_rows[-1]["action"] == "feature_health"
+    assert manual_rows[-1]["health_status"] == "HEALTHY"
