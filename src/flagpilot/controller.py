@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, TextIO
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
 
 from flagpilot.apply import ApprovalDeniedError, ApprovedFlagsmithWriter
 from flagpilot.types import (
@@ -27,6 +31,12 @@ from flagpilot.types import (
 
 logger = logging.getLogger(__name__)
 
+OBSERVED_LABEL = "OBSERVED"
+
+
+class SignalCollectionError(RuntimeError):
+    """Raised when an external error-rate signal provider fails (fail-closed rollback)."""
+
 
 class StageSignalProvider(Protocol):
     """Source of per-stage evaluation metrics for the rollout controller."""
@@ -34,6 +44,165 @@ class StageSignalProvider(Protocol):
     def collect(self, plan: Plan, step: Step) -> StageMetrics:
         """Collect traffic and error metrics at the active stage."""
         ...
+
+
+def _sanitize_signal_url(raw_url: str) -> str:
+    """Strip embedded credentials, query strings, and fragments from a signal URL."""
+    parts = urlsplit(raw_url.strip())
+    host = parts.hostname or ""
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path or "/", "", ""))
+
+
+def _scrub_url_credentials(text: str, raw_url: str, safe_url: str) -> str:
+    cleaned = text.replace(raw_url, safe_url)
+    parts = urlsplit(raw_url.strip())
+    for secret in (parts.password, parts.username, parts.query):
+        if secret:
+            cleaned = cleaned.replace(secret, "[REDACTED]")
+    return cleaned
+
+
+def _parse_error_rate_payload(raw_text: str, *, source_name: str) -> float:
+    """Parse JSON ``{"error_rate": <float>}`` or a plain float strictly in [0.0, 1.0]."""
+    cleaned = raw_text.strip()
+    if not cleaned:
+        raise SignalCollectionError(f"{source_name} returned an empty response.")
+
+    value: Any
+    try:
+        decoded = json.loads(cleaned)
+    except json.JSONDecodeError:
+        try:
+            value = float(cleaned)
+        except ValueError as exc:
+            raise SignalCollectionError(
+                f"{source_name} returned non-numeric / malformed payload."
+            ) from exc
+    else:
+        if isinstance(decoded, dict):
+            if "error_rate" not in decoded:
+                raise SignalCollectionError(
+                    f"{source_name} JSON payload missing required 'error_rate' field."
+                )
+            value = decoded["error_rate"]
+        elif isinstance(decoded, (int, float)) and not isinstance(decoded, bool):
+            value = decoded
+        else:
+            raise SignalCollectionError(
+                f"{source_name} returned unsupported JSON type {type(decoded).__name__}."
+            )
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SignalCollectionError(
+            f"{source_name} error_rate must be a numeric float, got {type(value).__name__}."
+        )
+    rate = float(value)
+    if not math.isfinite(rate) or not (0.0 <= rate <= 1.0):
+        raise SignalCollectionError(
+            f"{source_name} error_rate {rate!r} is outside valid range [0.0, 1.0]."
+        )
+    return rate
+
+
+class HttpSignalProvider:
+    """Reads observed error rate in [0, 1] from an HTTP GET endpoint."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float = 5.0,
+        session: requests.Session | None = None,
+    ) -> None:
+        cleaned = url.strip()
+        parts = urlsplit(cleaned)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError("signal URL must be a valid http:// or https:// URL.")
+        if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
+            raise ValueError("signal timeout_seconds must be > 0.")
+        self._url = cleaned
+        self._safe_url = _sanitize_signal_url(cleaned)
+        self._timeout_seconds = float(timeout_seconds)
+        self._session = session
+
+    @property
+    def safe_url(self) -> str:
+        """Return credential-free URL suitable for logging."""
+        return self._safe_url
+
+    def collect(self, plan: Plan, step: Step) -> StageMetrics:
+        """Fetch and validate an observed error rate via HTTP GET."""
+        del plan
+        try:
+            if self._session is not None:
+                resp = self._session.get(self._url, timeout=self._timeout_seconds)
+            else:
+                resp = requests.get(self._url, timeout=self._timeout_seconds)
+        except requests.RequestException as exc:
+            sanitized = _scrub_url_credentials(str(exc), self._url, self._safe_url)
+            logger.warning("HttpSignalProvider failed (%s): %s", self._safe_url, sanitized)
+            raise SignalCollectionError(
+                f"HTTP signal request failed for {self._safe_url}: {sanitized}"
+            ) from exc
+
+        if not resp.ok:
+            logger.warning(
+                "HttpSignalProvider returned HTTP %s from %s",
+                resp.status_code,
+                self._safe_url,
+            )
+            raise SignalCollectionError(
+                f"HTTP signal {self._safe_url} returned HTTP {resp.status_code}."
+            )
+
+        rate = _parse_error_rate_payload(
+            resp.text,
+            source_name=f"HTTP signal ({self._safe_url})",
+        )
+        return StageMetrics(
+            percentage=step.percentage,
+            sample_count=max(step.min_samples, 1),
+            error_count=0,
+            enabled_count=0,
+            source_label=OBSERVED_LABEL,
+            reported_error_rate=rate,
+        )
+
+
+class FileSignalProvider:
+    """Reads observed error rate in [0, 1] from a local file path."""
+
+    def __init__(self, file_path: str | Path) -> None:
+        raw_str = str(file_path).strip()
+        if not raw_str:
+            raise ValueError("signal file path must not be empty.")
+        self._path = Path(raw_str)
+
+    def collect(self, plan: Plan, step: Step) -> StageMetrics:
+        """Read and validate an observed error rate from a local file."""
+        del plan
+        try:
+            raw_text = self._path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("FileSignalProvider failed (%s): %s", self._path, exc)
+            raise SignalCollectionError(
+                f"File signal failed reading {self._path}: {exc}"
+            ) from exc
+
+        rate = _parse_error_rate_payload(
+            raw_text,
+            source_name=f"File signal ({self._path})",
+        )
+        return StageMetrics(
+            percentage=step.percentage,
+            sample_count=max(step.min_samples, 1),
+            error_count=0,
+            enabled_count=0,
+            source_label=OBSERVED_LABEL,
+            reported_error_rate=rate,
+        )
 
 
 def append_audit_entry(
@@ -137,6 +306,7 @@ def evaluate_stage(
     *,
     observed_error_rate: float | None = None,
     rollback_target: int = 0,
+    enforce_min_samples: bool = True,
 ) -> Decision:
     """Decide whether to hold, rollback, advance, or complete a rollout stage."""
     if sample_count < 0 or error_count < 0 or error_count > sample_count:
@@ -149,7 +319,7 @@ def evaluate_stage(
         if observed_error_rate is not None
         else (error_count / sample_count if sample_count > 0 else 0.0)
     )
-    if sample_count == 0 or sample_count < step.min_samples:
+    if enforce_min_samples and (sample_count == 0 or sample_count < step.min_samples):
         return Decision(
             action="hold",
             reason=f"Insufficient samples ({sample_count} < {step.min_samples}).",
@@ -326,7 +496,7 @@ class RolloutController:
         caption = (
             f"SYNTHETIC DATA — {plan.feature_name} ({plan.environment})"
             if is_synthetic
-            else f"{plan.feature_name} ({plan.environment})"
+            else f"OBSERVED ERROR SIGNAL (Simulated Identities) — {plan.feature_name} ({plan.environment})"
         )
         table = Table(
             title=f"FlagPilot Live Rollout: {plan.feature_name} ({plan.environment})",
@@ -561,33 +731,57 @@ class RolloutController:
                 if self._interval_seconds > 0:
                     self._sleep_fn(self._interval_seconds)
 
-                metrics = self._signal_provider.collect(plan, step)
-                monotonic_check = _compute_monotonicity_check(
-                    prev_stage_pct,
-                    prev_exposed_ids,
-                    step.percentage,
-                    metrics.exposed_identities,
-                )
-                if monotonic_check is not None and not use_live_table:
-                    self._output_stream.write(
-                        f"Monotonicity check: {monotonic_check.summary}\n"
-                    )
-                prev_stage_pct = step.percentage
-                if metrics.exposed_identities is not None:
-                    prev_exposed_ids = frozenset(metrics.exposed_identities)
-
                 next_step = steps[index + 1] if index + 1 < len(steps) else None
                 rollback_target = (
                     plan.rollback_percentage if self._rollback_to_zero else previous_safe_percentage
                 )
-                decision = evaluate_stage(
-                    step=step,
-                    sample_count=metrics.sample_count,
-                    error_count=metrics.error_count,
-                    next_step=next_step,
-                    observed_error_rate=metrics.error_rate,
-                    rollback_target=rollback_target,
-                )
+                try:
+                    metrics = self._signal_provider.collect(plan, step)
+                except SignalCollectionError as exc:
+                    metrics = StageMetrics(
+                        percentage=step.percentage,
+                        sample_count=0,
+                        error_count=0,
+                        enabled_count=0,
+                        source_label=OBSERVED_LABEL,
+                        reported_error_rate=1.0,
+                    )
+                    monotonic_check = None
+                    decision = Decision(
+                        action="rollback",
+                        reason=(
+                            f"Signal collection failed (fail-closed): {exc}; "
+                            f"rolling back to {rollback_target}%."
+                        ),
+                        current_percentage=step.percentage,
+                        next_percentage=rollback_target,
+                        observed_error_rate=1.0,
+                        sample_count=0,
+                    )
+                else:
+                    monotonic_check = _compute_monotonicity_check(
+                        prev_stage_pct,
+                        prev_exposed_ids,
+                        step.percentage,
+                        metrics.exposed_identities,
+                    )
+                    if monotonic_check is not None and not use_live_table:
+                        self._output_stream.write(
+                            f"Monotonicity check: {monotonic_check.summary}\n"
+                        )
+                    prev_stage_pct = step.percentage
+                    if metrics.exposed_identities is not None:
+                        prev_exposed_ids = frozenset(metrics.exposed_identities)
+
+                    decision = evaluate_stage(
+                        step=step,
+                        sample_count=metrics.sample_count,
+                        error_count=metrics.error_count,
+                        next_step=next_step,
+                        observed_error_rate=metrics.error_rate,
+                        rollback_target=rollback_target,
+                        enforce_min_samples=(metrics.source_label != OBSERVED_LABEL),
+                    )
                 outcomes.append(
                     StageOutcome(
                         step=step,
