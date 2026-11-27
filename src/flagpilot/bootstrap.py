@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from dotenv import dotenv_values
+from dotenv import dotenv_values, load_dotenv
 
 from flagpilot.fsapi import FlagsmithConfig, FlagsmithManagementClient
 
@@ -31,13 +32,17 @@ class BootstrapError(RuntimeError):
     """Raised when bootstrapping self-hosted Flagsmith fails."""
 
 
+def _default_admin_password() -> str:
+    return os.environ.get("FLAGPILOT_ADMIN_PASSWORD") or DEFAULT_PASSWORD
+
+
 @dataclass(frozen=True)
 class BootstrapConfig:
     """Configuration for automated local Flagsmith bootstrap."""
 
     base_url: str = DEFAULT_BASE_URL
     email: str = DEFAULT_EMAIL
-    password: str = field(default=DEFAULT_PASSWORD, repr=False)
+    password: str = field(default_factory=_default_admin_password, repr=False)
     first_name: str = DEFAULT_FIRST_NAME
     last_name: str = DEFAULT_LAST_NAME
     org_name: str = DEFAULT_ORG_NAME
@@ -557,6 +562,7 @@ def bootstrap_flagsmith(
 
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point for ``python -m flagpilot.bootstrap``."""
+    load_dotenv()
     parser = argparse.ArgumentParser(
         prog="python -m flagpilot.bootstrap",
         description="Bootstrap local self-hosted Flagsmith and write .env.",
