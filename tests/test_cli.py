@@ -497,3 +497,120 @@ def test_cli_plan_use_llm_routes_through_adapter_and_keeps_approve_gate(
     assert apply_code == 1
     assert fake_backend.calls == []
     assert "non-interactive" in capsys.readouterr().err.lower()
+
+
+def test_cli_run_signal_file_and_signal_url_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--signal-file and --signal-url breach at 1% directly, fail closed, and avoid SYNTHETIC error label."""
+    import requests
+
+    monkeypatch.setenv("FLAGSMITH_API_URL", "http://localhost:8000/api/v1")
+    monkeypatch.setenv("FLAGSMITH_ADMIN_KEY", "dummy-admin")
+
+    # Mutually exclusive flags rejected
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "run",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--signal-url",
+                "http://localhost:9090/err",
+                "--signal-file",
+                str(tmp_path / "sig.json"),
+            ]
+        )
+
+    # 1. --signal-file with breach (0.05 > 0.02) rolls back at stage 1% even though 1% exposed < min_samples=20
+    sig_file = tmp_path / "sig.json"
+    sig_file.write_text('{"error_rate": 0.05}', encoding="utf-8")
+    backend1 = _FakeBackend()
+    run_out1 = tmp_path / "run_sig.json"
+    html_out1 = tmp_path / "rollout_sig.html"
+    stdin1 = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin1, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin1)
+    with patch("flagpilot.cli.FlagsmithManagementClient", return_value=backend1):
+        code1 = main(
+            [
+                "run",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--signal-file",
+                str(sig_file),
+                "--rollback-to-zero",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(tmp_path / "audit_sig.log"),
+                "--run-out",
+                str(run_out1),
+                "--report-out",
+                str(html_out1),
+            ]
+        )
+    assert code1 == 1
+    assert backend1.calls == [("apply", 1), ("rollback", 0)]
+    out1 = capsys.readouterr().out
+    assert "[OBSERVED] Rollout finished with status: rolled_back" in out1
+
+    run_json = json.loads(run_out1.read_text(encoding="utf-8"))
+    assert run_json["is_synthetic"] is False
+    assert run_json["traffic_label"] == "OBSERVED"
+    assert run_json["outcomes"][0]["metrics"]["source_label"] == "OBSERVED"
+    assert run_json["post_rollback_verification"]["verified"] is True
+    html_text = html_out1.read_text(encoding="utf-8")
+    assert "OBSERVED ERROR SIGNAL (SYNTHETIC IDENTITIES)" in html_text
+
+    # 2. --signal-url timeout fails closed and scrubs credentials from logs/report
+    backend2 = _FakeBackend()
+    stdin2 = io.StringIO("APPROVE\n")
+    monkeypatch.setattr(stdin2, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin2)
+    audit2 = tmp_path / "audit_url.log"
+    secret_url = "https://ops:top-secret-token@metrics.example.com/err?key=k123"
+    with (
+        patch("flagpilot.cli.FlagsmithManagementClient", return_value=backend2),
+        patch(
+            "flagpilot.controller.requests.get",
+            side_effect=requests.Timeout(f"timed out {secret_url}"),
+        ),
+    ):
+        code2 = main(
+            [
+                "run",
+                "--feature",
+                "checkout_v2",
+                "--env",
+                "Development",
+                "--offline-evaluator",
+                "--signal-url",
+                secret_url,
+                "--signal-timeout",
+                "1.0",
+                "--rollback-to-zero",
+                "--identities-file",
+                str(tmp_path / "ids.json"),
+                "--audit-log",
+                str(audit2),
+                "--run-out",
+                str(tmp_path / "run_url.json"),
+                "--report-out",
+                str(tmp_path / "rollout_url.html"),
+            ]
+        )
+    assert code2 == 1
+    assert backend2.calls == [("apply", 1), ("rollback", 0)]
+    audit2_text = audit2.read_text(encoding="utf-8")
+    assert "fail-closed" in audit2_text
+    assert "top-secret-token" not in audit2_text
+    assert "k123" not in audit2_text
+    capsys.readouterr()
