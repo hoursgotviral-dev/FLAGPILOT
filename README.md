@@ -1,6 +1,10 @@
 # FlagPilot
 
-![FlagPilot Rollout Report showing monotonic 1% to 10% to 50% retention, 26.32% error-spike rollback to 0%, 0/200 post-rollback verification, and Grafana Feature Health UNHEALTHY/HEALTHY webhooks](docs/assets/rollout-report.png)
+Terminal-first progressive rollout controller for self-hosted Flagsmith (`2.295.2`).
+Turn plain-English rollout requests into deterministic stage plans gated by explicit human `APPROVE`.
+Monitor simulated or external error-rate signals (`--signal-url` / `--signal-file`), fail closed to `0%`, and check cohort monotonicity.
+
+![FlagPilot Rollout Report showing 1% to 10% to 50% monotonicity check, 26.32% error-spike rollback to 0%, 0/200 post-rollback verification, and Grafana Feature Health UNHEALTHY/HEALTHY webhooks](docs/assets/rollout-report.png)
 
 ## The problem
 
@@ -11,9 +15,9 @@ Feature flag rollouts often jump straight from disabled to 100% or rely on ad-ho
 FlagPilot orchestrates staged **% Split** (`PERCENTAGE_SPLIT`) rollouts on self-hosted Flagsmith through four safeguards:
 
 1. **Zero-key deterministic planning (`planner.py`)**: A rule-based parser turns a plain-English rollout request into `plan.json` and `plan.md` with no LLM, no external API keys, and zero network calls by default. An optional thin `plan_with_llm()` adapter (enabled only via `--use-llm` or `FLAGPILOT_LLM_PROVIDER` + `GEMINI_API_KEY`/`OPENAI_API_KEY`) requests strict `Plan` JSON via standard-library `urllib.request`, validates through `plan_from_dict()`, falls back cleanly to the deterministic parser on error, and passes through the identical diff review and mandatory `APPROVE` gate.
-2. **Mandatory human approval (`apply.py`)**: Every Flagsmith mutation requires an interactive TTY where the operator types exact `APPROVE`; non-interactive runs refuse and there is no `--auto-approve` or `--yes` flag. On `flagpilot run`, one upfront `APPROVE` authorizes the full stage schedule and safety policy so stages and emergency rollback execute automatically without mid-incident prompts (per-stage prompts remain opt-in via `--step-approve`).
-3. **Stable persistent identities (`simulator.py`)**: Evaluations always supply persistent identities (`user_000`..`user_199` by default) because Flagsmith `% Split` hashing does not work on anonymous requests, with all simulated data labelled `SYNTHETIC DATA`.
-4. **Deterministic rollback, monotonic proof & Rich UI (`controller.py`, `report.py`)**: Advances through configurable stages (default `1% -> 10% -> 50% -> 100%`) in a live `rich` rollout table (`--plain` for plain text), tracks exact exposed identity IDs per stage (`retained_from_previous_stage` monotonicity proof), automatically rolls back to the previous safe percentage or `0%` (`--rollback-to-zero`, default in demo runners) on error breach, runs a post-rollback `0/200` verification tick, notifies Flagsmith Grafana Feature Health (`FLAGSMITH_HEALTH_WEBHOOK_URL`) fail-safely (`UNHEALTHY` on rollback -> `HEALTHY` on completion/reset), logs every decision in UTC to `audit.log` without secrets, and renders `reports/rollout.html`.
+2. **Mandatory human approval (`apply.py`)**: `ApprovedFlagsmithWriter` gates every Flagsmith rollout mutation (`apply`, `run`, `rollback`), refusing non-interactive TTYs and anything other than exact `APPROVE` with no `--auto-approve` or `--yes` flag (while `bootstrap` for local dev setup and fail-safe Feature Health webhooks are intentionally exempt). On `flagpilot run`, one upfront `APPROVE` authorizes the schedule and safety policy so emergency rollback executes immediately during an incident instead of blocking on mid-incident human input (per-stage prompts remain opt-in via `--step-approve`).
+3. **Stable persistent identities (`simulator.py`)**: Evaluations always supply persistent identities (`user_000`..`user_199` by default) because Flagsmith `% Split` hashing does not work on anonymous requests, with all simulated data labelled `SYNTHETIC DATA` (and observed external error rates labelled `OBSERVED`).
+4. **Deterministic rollback, monotonicity check & Rich UI (`controller.py`, `report.py`)**: Advances through configurable stages (default `1% -> 10% -> 50% -> 100%`) in a live `rich` rollout table (`--plain` for plain text), tracks exact exposed identity IDs per stage (`retained_from_previous_stage` monotonicity check), automatically rolls back to the previous safe percentage or `0%` (`--rollback-to-zero`, default in demo runners) on error breach or signal failure, runs a post-rollback `0/200` verification tick, notifies Flagsmith Grafana Feature Health (`FLAGSMITH_HEALTH_WEBHOOK_URL`) fail-safely (`UNHEALTHY` on rollback -> `HEALTHY` on completion/reset), logs every decision in UTC to `audit.log` without secrets, and renders `reports/rollout.html`.
 
 ## Architecture
 
@@ -66,10 +70,26 @@ If you delete Flagsmith's `PERCENTAGE_SPLIT` segment rules and SDK evaluation fr
 | `bootstrap` | `flagpilot bootstrap` | Zero-UI setup against `http://localhost:8000`; writes `.env` idempotently. |
 | `plan` | `flagpilot plan "<request>"` | Parse request offline (`--use-llm` optional via `plan_with_llm()`), render Rich panel (`--plain` fallback), write `plan.json` + `plan.md`. |
 | `apply` | `flagpilot apply plan.json` | Print plan, require exact `APPROVE`, and apply target percentage to Flagsmith. |
-| `run` | `flagpilot run ...` | Require upfront policy `APPROVE` (`--step-approve` opt-in), render live table, verify monotonic retention, auto-roll back (`--rollback-to-zero`) + verify `0/200`, notify Feature Health. |
+| `run` | `flagpilot run ...` | Require upfront policy `APPROVE` (`--step-approve` opt-in), render live table, run monotonicity check, auto-roll back (`--rollback-to-zero`) + verify `0/200`, notify Feature Health. |
 | `rollback` | `flagpilot rollback ...` | Gate and apply a `0%` rollback and disable segment override, logging to `audit.log`. |
 | `report` | `flagpilot report` | Read `audit.log` and `reports/last_run.json` and render static `reports/rollout.html`. |
 | Task runners | `scripts/demo`, `Makefile`, `tasks.ps1` | Cross-platform `up`, `bootstrap`, `down`, `test`, `lint`, `smoke`, and `demo`. |
+
+### Bring your own error signal
+
+By default `flagpilot run` simulates error rates alongside persistent Flagsmith identities (`SYNTHETIC DATA`). Pass `--signal-url` or `--signal-file` to feed real observed error telemetry (`OBSERVED`):
+
+```bash
+# HTTP GET returning JSON {"error_rate": 0.012} or a plain float in [0, 1]
+.venv/bin/flagpilot run --feature checkout_v2 --env Development \
+  --signal-url http://localhost:9090/checkout-errors --signal-timeout 5 --rollback-to-zero
+
+# Local file containing JSON {"error_rate": 0.012} or a plain float in [0, 1]
+.venv/bin/flagpilot run --feature checkout_v2 --env Development \
+  --signal-file ./metrics/error_rate.json --rollback-to-zero
+```
+
+When `--signal-url` or `--signal-file` is active, the external `OBSERVED` error rate is evaluated directly against `max_error_rate` at every stage (including `1%`, bypassing `min_samples` gating) while simulated identities are still evaluated separately; timeouts, HTTP failures, malformed payloads, or values outside `[0, 1]` fail closed and trigger rollback with the exact reason logged.
 
 ### What makes this hard to break
 
@@ -109,7 +129,7 @@ During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when pr
 .
 ├── .github/workflows/ci.yml         # GitHub Actions CI (ruff + offline pytest on Python 3.11 & 3.13)
 ├── pyproject.toml                   # Python >=3.11 packaging, deps (requests, python-dotenv, flagsmith, rich), pytest markers
-├── docker-compose.yml               # Official self-hosted Flagsmith + Postgres compose stack
+├── docker-compose.yml               # Pinned Flagsmith 2.295.2 (migrate-db, serve, task-processor) + Postgres 15.5 stack
 ├── .env.example                     # Placeholder env vars (FLAGSMITH_API_URL, keys, project/feature/segment IDs)
 ├── .gitattributes                   # Enforces LF on *.sh, scripts/demo, Makefile; CRLF on *.ps1
 ├── .gitignore                       # Ignores .env, *.env.local, audit.log, reports/, .venv/, caches, build artifacts
@@ -145,7 +165,7 @@ During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when pr
 
 ## How I used Flagsmith
 
-- **Self-hosted Flagsmith (`2.295.2`)**: Runs locally via `docker-compose.yml` (`http://localhost:8000`) and is provisioned without UI clicks by `flagpilot bootstrap` (`/health/liveness/`, `/version/`, `/api/v1/auth/users/`, `/api/v1/auth/login/`, `/api/v1/organisations/`, `/api/v1/organisations/{id}/master-api-keys/`, `/api/v1/environments/{client_key}/api-keys/`).
+- **Self-hosted Flagsmith (`docker.flagsmith.com/flagsmith/flagsmith:2.295.2`)**: Runs locally via [docker-compose.yml](docker-compose.yml), which pins `2.295.2` across `migrate-db`, `flagsmith`, and `flagsmith-task-processor` because `/api/__future__/` segment-override and Feature Health APIs can change across releases. Provisioned without UI clicks by `flagpilot bootstrap` (`/health/liveness/`, `/version/`, `/api/v1/auth/users/`, `/api/v1/auth/login/`, `/api/v1/organisations/`, `/api/v1/organisations/{id}/master-api-keys/`, `/api/v1/environments/{client_key}/api-keys/`).
 - **`% Split` (`PERCENTAGE_SPLIT`) segments**: Creates and updates project segments with `operator: "PERCENTAGE_SPLIT"`, `property: null`, and `value: "<percent>"` via `/api/v1/projects/{project_id}/segments/`.
 - **Segment overrides (v1 & v2 compatible)**: Reads and patches segment overrides via `GET`/`PATCH /api/__future__/environments/{env_key}/features/{feature_id}/` so `environment_default.enabled` stays `false` while the rollout segment override is toggled cleanly across both Feature Versioning v1 and v2.
 - **Stable persistent identities**: Evaluates every rollout round with the exact same ordered identities (`user_000`..`user_199`) via `Flagsmith.get_identity_flags(identifier=...)` with `enable_local_evaluation=True` and explicit `update_environment()` refresh per round.
@@ -153,5 +173,5 @@ During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when pr
 
 ## Development status
 
-- **Unit CI (`pytest -v` & `ruff check src tests` via `.github/workflows/ci.yml`)**: `47` offline tests pass (`1` live test skipped unless `FLAGPILOT_LIVE_TEST=1`) and `ruff` passes with zero issues across Python `3.11` and `3.13`. Also supports `--plain` for deterministic plain-text CI logs alongside Rich terminal panels/tables.
-- **Live Flagsmith integration (`FLAGPILOT_LIVE_TEST=1 pytest -m live -v`)**: Verified against live self-hosted Flagsmith `2.295.2` (`1 passed`), covering idempotent `bootstrap`, single upfront `APPROVE` policy gate, monotonic `1% -> 10% -> 50%` retention proof, automatic `0%` rollback + `0/200` post-rollback verification on fault spike, Grafana Feature Health `UNHEALTHY`/`HEALTHY` webhook delivery, `audit.log` recording, and static `reports/rollout.html`.
+- **Offline CI (`.\tasks.ps1 test` / `pytest -v` & `ruff check src tests` via `.github/workflows/ci.yml`)**: Runs the mocked/offline unit suite (`@pytest.mark.live` skipped unless `FLAGPILOT_LIVE_TEST=1`) and `ruff` linter cleanly across Python `3.11` and `3.13`, with `--plain` for deterministic plain-text logs alongside Rich terminal panels/tables.
+- **Live Flagsmith integration (`.\tasks.ps1 smoke` / `make smoke` -> `FLAGPILOT_LIVE_TEST=1 pytest -m live -v`)**: Verifies the live pinned Flagsmith `2.295.2` stack end-to-end, covering idempotent `bootstrap`, single upfront `APPROVE` policy gate, `1% -> 10% -> 50%` monotonicity check, automatic `0%` rollback + `0/200` post-rollback verification on fault spike, Grafana Feature Health `UNHEALTHY`/`HEALTHY` webhook delivery, `audit.log` recording, and static `reports/rollout.html`.

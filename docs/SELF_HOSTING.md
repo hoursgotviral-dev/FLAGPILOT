@@ -7,13 +7,13 @@
 
 ## Flagsmith Setup (Zero-Click Bootstrap)
 
-1. Start the official self-hosted Flagsmith stack from the repository root:
+1. Start the official self-hosted Flagsmith stack from the repository root (`docker-compose.yml` pins `docker.flagsmith.com/flagsmith/flagsmith:2.295.2` across `migrate-db`, `flagsmith`, and `flagsmith-task-processor` because FlagPilot relies on `/api/__future__/` segment-override and Feature Health APIs that may change across releases):
 
    ```bash
    docker compose up -d
    ```
 
-2. Run FlagPilot's idempotent bootstrapper (polls `http://localhost:8000/health/liveness/`, checks `GET /version/`, creates the initial superuser or logs in, creates/reuses organisation/project/environment, mints or preserves the Master API key and server SDK key, creates the `checkout_v2` demo feature with global default `false` and a `0%` `PERCENTAGE_SPLIT` segment override, idempotently retrieves/creates a `"Grafana"` Feature Health provider webhook, and writes local `.env` without printing secrets):
+2. Run FlagPilot's idempotent bootstrapper (polls `http://localhost:8000/health/liveness/`, checks `GET /version/`, creates the initial superuser using `FLAGPILOT_ADMIN_PASSWORD` or the default local dev password — or logs in, creates/reuses organisation/project/environment, mints or preserves the Master API key and server SDK key, creates the `checkout_v2` demo feature with global default `false` and a `0%` `PERCENTAGE_SPLIT` segment override, idempotently retrieves/creates a `"Grafana"` Feature Health provider webhook, and writes local `.env` without printing secrets):
 
    - **macOS / Linux**: `.venv/bin/flagpilot bootstrap` (or `make up && make bootstrap`)
    - **Windows PowerShell**: `.venv\Scripts\flagpilot.exe bootstrap` (or `.\tasks.ps1 up; .\tasks.ps1 bootstrap`)

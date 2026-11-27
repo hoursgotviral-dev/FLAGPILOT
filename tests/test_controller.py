@@ -7,13 +7,20 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from flagpilot.apply import ApprovedFlagsmithWriter
 from flagpilot.cli import main
-from flagpilot.controller import RolloutController, execute_manual_rollback
+from flagpilot.controller import (
+    FileSignalProvider,
+    HttpSignalProvider,
+    RolloutController,
+    SignalCollectionError,
+    execute_manual_rollback,
+)
 from flagpilot.planner import build_plan
 from flagpilot.simulator import OfflineFakeEvaluator, TrafficSimulator, make_error_rate_fn
 from flagpilot.types import Plan, StageMetrics, Step
@@ -596,3 +603,142 @@ def test_controller_upfront_approve_non_interactive_abort_and_step_approve_opt_i
     ).run(build_plan("checkout_v2", "Development"))
     assert res_step.final_status == "paused"
     assert client_step.percentage_history == [1]
+
+
+def test_http_signal_provider_and_fail_closed_credential_sanitization(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """HttpSignalProvider parses JSON/float, strips URL credentials, and fails closed in controller."""
+    plan = build_plan("checkout_v2", "Development", stages=(1, 10))
+    step = plan.steps[0]
+
+    def _http_resp(text: str, status_code: int = 200) -> MagicMock:
+        r = MagicMock()
+        r.status_code = status_code
+        r.ok = 200 <= status_code < 300
+        r.text = text
+        return r
+
+    session = MagicMock()
+    session.get.side_effect = [
+        _http_resp('{"error_rate": 0.012}'),
+        _http_resp("0.015\n"),
+        _http_resp("bad", status_code=503),
+        _http_resp("{malformed"),
+        _http_resp('{"error_rate": 1.25}'),
+        _http_resp('{"error_rate": NaN}'),
+    ]
+    raw_url = "https://alice:super-secret-pw@metrics.internal:8443/errors?token=tok-999"
+    provider = HttpSignalProvider(raw_url, timeout_seconds=2.5, session=session)
+    assert provider.safe_url == "https://metrics.internal:8443/errors"
+
+    m1 = provider.collect(plan, step)
+    assert m1.source_label == "OBSERVED"
+    assert m1.error_rate == pytest.approx(0.012)
+    assert session.get.call_args_list[0].kwargs["timeout"] == 2.5
+
+    m2 = provider.collect(plan, step)
+    assert m2.error_rate == pytest.approx(0.015)
+
+    for _ in range(4):
+        with pytest.raises(SignalCollectionError) as exc_info:
+            provider.collect(plan, step)
+        assert "super-secret-pw" not in str(exc_info.value)
+        assert "tok-999" not in str(exc_info.value)
+
+    # Timeout triggers fail-closed rollback in RolloutController without leaking URL secrets
+    session_timeout = MagicMock()
+    session_timeout.get.side_effect = requests.ReadTimeout(f"timeout fetching {raw_url}")
+    client = _FakeFlagsmithClient()
+    audit_log = tmp_path / "audit_http_fail.log"
+    out = io.StringIO()
+    with caplog.at_level("WARNING"):
+        res = RolloutController(
+            ApprovedFlagsmithWriter(
+                client,
+                input_stream=io.StringIO("APPROVE\n"),
+                output_stream=io.StringIO(),
+                is_tty=True,
+            ),
+            HttpSignalProvider(raw_url, timeout_seconds=1.5, session=session_timeout),
+            audit_log_path=audit_log,
+            output_stream=out,
+            rollback_to_zero=True,
+        ).run(plan, is_synthetic=False)
+
+    assert res.final_status == "rolled_back"
+    assert res.rollback_applied is True
+    assert res.rollback_to_percentage == 0
+    assert client.percentage_history == [1, 0]
+    audit_text = audit_log.read_text(encoding="utf-8")
+    assert "fail-closed" in audit_text
+    assert "super-secret-pw" not in audit_text
+    assert "tok-999" not in audit_text
+    assert "super-secret-pw" not in caplog.text
+    assert "tok-999" not in out.getvalue()
+
+
+def test_file_signal_provider_direct_breach_at_1pct_and_fail_closed(tmp_path: Path) -> None:
+    """FileSignalProvider evaluates OBSERVED rates directly at 1% (ignoring min_samples) and fails closed."""
+    plan = build_plan("checkout_v2", "Development", stages=(1, 10), min_samples=20, max_error_rate=0.02)
+
+    # 1. Valid plain float and JSON
+    f_ok = tmp_path / "ok.txt"
+    f_ok.write_text("0.018\n", encoding="utf-8")
+    assert FileSignalProvider(f_ok).collect(plan, plan.steps[0]).error_rate == pytest.approx(0.018)
+
+    f_json = tmp_path / "ok.json"
+    f_json.write_text('{"error_rate": 0.011}', encoding="utf-8")
+    assert FileSignalProvider(f_json).collect(plan, plan.steps[0]).error_rate == pytest.approx(0.011)
+
+    # 2. Small sample/exposed count with OBSERVED label STILL triggers breach at 1%
+    class _SmallObservedProvider:
+        def collect(self, active_plan: Plan, step: Step) -> StageMetrics:
+            del active_plan
+            return StageMetrics(
+                percentage=step.percentage,
+                sample_count=5,
+                error_count=0,
+                enabled_count=2,
+                source_label="OBSERVED",
+                reported_error_rate=0.05,
+            )
+
+    client_breach = _FakeFlagsmithClient()
+    res_breach = RolloutController(
+        ApprovedFlagsmithWriter(
+            client_breach,
+            input_stream=io.StringIO("APPROVE\n"),
+            output_stream=io.StringIO(),
+            is_tty=True,
+        ),
+        _SmallObservedProvider(),
+        audit_log_path=tmp_path / "audit_obs.log",
+        output_stream=io.StringIO(),
+        rollback_to_zero=True,
+    ).run(plan, is_synthetic=False)
+    assert res_breach.final_status == "rolled_back"
+    assert client_breach.percentage_history == [1, 0]
+
+    # 3. Missing or invalid signal file fails closed
+    client_missing = _FakeFlagsmithClient()
+    res_missing = RolloutController(
+        ApprovedFlagsmithWriter(
+            client_missing,
+            input_stream=io.StringIO("APPROVE\n"),
+            output_stream=io.StringIO(),
+            is_tty=True,
+        ),
+        FileSignalProvider(tmp_path / "missing.json"),
+        audit_log_path=tmp_path / "audit_missing.log",
+        output_stream=io.StringIO(),
+        rollback_to_zero=True,
+    ).run(plan, is_synthetic=False)
+    assert res_missing.final_status == "rolled_back"
+    assert "Signal collection failed (fail-closed)" in res_missing.outcomes[0].decision.reason
+
+    f_bad = tmp_path / "bad.txt"
+    f_bad.write_text("-0.05", encoding="utf-8")
+    with pytest.raises(SignalCollectionError):
+        FileSignalProvider(f_bad).collect(plan, plan.steps[0])

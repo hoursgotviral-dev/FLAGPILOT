@@ -424,6 +424,15 @@ def render_html_report(
             "traffic and synthetic error rates rather than live production user traffic."
             "</div>"
         )
+    else:
+        synthetic_banner = (
+            '<div class="banner banner-synthetic" role="status">'
+            "<strong>OBSERVED ERROR SIGNAL (SYNTHETIC IDENTITIES):</strong> Error-rate telemetry "
+            "was supplied by an external signal provider (<code>--signal-url</code> / "
+            "<code>--signal-file</code>), while cohort exposure evaluated simulated persistent "
+            "identities."
+            "</div>"
+        )
 
     rollback_banner = ""
     if show_rollback_banner:
@@ -821,6 +830,10 @@ def render_markdown_report(result: RolloutRunResult) -> str:
     ]
     if result.is_synthetic:
         lines.append("- **Data Source**: `SYNTHETIC DATA` (simulated identity traffic)")
+    else:
+        lines.append(
+            "- **Error Signal Source**: `OBSERVED` (external signal provider; simulated identities)"
+        )
     if result.health_status is not None:
         delivery = "webhook delivered" if result.health_webhook_sent else "webhook skipped/failed"
         lines.append(f"- **Feature Health**: `{result.health_status}` ({delivery})")

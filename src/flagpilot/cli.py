@@ -22,7 +22,14 @@ from flagpilot.bootstrap import (
     BootstrapError,
     bootstrap_flagsmith,
 )
-from flagpilot.controller import RolloutController, execute_manual_rollback
+from flagpilot.controller import (
+    OBSERVED_LABEL,
+    FileSignalProvider,
+    HttpSignalProvider,
+    RolloutController,
+    StageSignalProvider,
+    execute_manual_rollback,
+)
 from flagpilot.fsapi import FlagsmithAPIError, FlagsmithConfig, FlagsmithManagementClient
 from flagpilot.planner import (
     DEFAULT_STAGES,
@@ -89,6 +96,64 @@ class _SyntheticSignalProvider:
                 min_samples=min_samples,
                 max_error_rate=max_error_rate,
             ),
+        )
+
+
+class _CompositeExternalSignalProvider:
+    """Combines simulated identity bucketing with a real external error-rate signal provider."""
+
+    def __init__(
+        self,
+        evaluator: FlagEvaluator,
+        simulator: TrafficSimulator,
+        external_provider: StageSignalProvider,
+        *,
+        verbose: bool = True,
+    ) -> None:
+        self._evaluator = evaluator
+        self._simulator = simulator
+        self._external_provider = external_provider
+        self._verbose = verbose
+
+    def collect(self, plan: Plan, step: Step) -> StageMetrics:
+        if isinstance(self._evaluator, OfflineFakeEvaluator):
+            self._evaluator.set_percentage(step.percentage)
+        round_result = self._simulator.run_round(plan.feature_name)
+        external = self._external_provider.collect(plan, step)
+        if self._verbose:
+            print(
+                f"[{external.source_label} | {SYNTHETIC_LABEL} identities] "
+                f"feature={plan.feature_name} exposed={round_result.exposed_count}/{round_result.total_count} "
+                f"({round_result.exposure_percentage:.1f}%) error_rate={external.error_rate:.2%}"
+            )
+        return StageMetrics(
+            percentage=step.percentage,
+            sample_count=round_result.total_count,
+            error_count=0,
+            enabled_count=round_result.exposed_count,
+            source_label=external.source_label,
+            reported_error_rate=external.error_rate,
+            exposed_identities=round_result.exposed_identities,
+        )
+
+    def verify_rollback(self, plan: Plan, target_percentage: int) -> StageMetrics:
+        """Evaluate persistent identities after rollback to confirm exposure reset."""
+        if isinstance(self._evaluator, OfflineFakeEvaluator):
+            self._evaluator.set_percentage(target_percentage)
+        round_result = self._simulator.run_round(plan.feature_name)
+        if self._verbose:
+            print(
+                f"[{SYNTHETIC_LABEL} identities] Post-rollback tick: "
+                f"exposed={round_result.exposed_count}/{round_result.total_count}"
+            )
+        return StageMetrics(
+            percentage=target_percentage,
+            sample_count=round_result.total_count,
+            error_count=0,
+            enabled_count=round_result.exposed_count,
+            source_label=OBSERVED_LABEL,
+            reported_error_rate=0.0,
+            exposed_identities=round_result.exposed_identities,
         )
 
 
@@ -246,6 +311,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="Render plain text progress instead of Rich tables and panels",
     )
+    signal_group = run_parser.add_mutually_exclusive_group()
+    signal_group.add_argument(
+        "--signal-url",
+        default=None,
+        help="HTTP GET endpoint returning JSON {\"error_rate\": <float>} or a plain float in [0, 1]",
+    )
+    signal_group.add_argument(
+        "--signal-file",
+        type=Path,
+        default=None,
+        help="Local file containing JSON {\"error_rate\": <float>} or a plain float in [0, 1]",
+    )
+    run_parser.add_argument(
+        "--signal-timeout",
+        type=float,
+        default=5.0,
+        help="HTTP timeout in seconds for --signal-url (default: 5.0)",
+    )
     run_parser.add_argument("--audit-log", type=Path, default=Path("audit.log"))
 
     rollback_parser = subparsers.add_parser(
@@ -370,11 +453,35 @@ def _handle_run(args: argparse.Namespace) -> int:
     )
     plain_mode = bool(getattr(args, "plain", False))
     tty_stdout = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    provider = _SyntheticSignalProvider(
-        evaluator,
-        simulator,
-        verbose=plain_mode or not tty_stdout,
-    )
+    verbose_signals = plain_mode or not tty_stdout
+    if args.signal_url:
+        external_provider: StageSignalProvider = HttpSignalProvider(
+            args.signal_url,
+            timeout_seconds=args.signal_timeout,
+        )
+        provider: StageSignalProvider = _CompositeExternalSignalProvider(
+            evaluator,
+            simulator,
+            external_provider,
+            verbose=verbose_signals,
+        )
+        is_synthetic = False
+    elif args.signal_file is not None:
+        external_provider = FileSignalProvider(args.signal_file)
+        provider = _CompositeExternalSignalProvider(
+            evaluator,
+            simulator,
+            external_provider,
+            verbose=verbose_signals,
+        )
+        is_synthetic = False
+    else:
+        provider = _SyntheticSignalProvider(
+            evaluator,
+            simulator,
+            verbose=verbose_signals,
+        )
+        is_synthetic = True
     controller = RolloutController(
         writer=writer,
         signal_provider=provider,
@@ -386,13 +493,14 @@ def _handle_run(args: argparse.Namespace) -> int:
         plain=plain_mode,
     )
     try:
-        result = controller.run(plan, is_synthetic=True)
+        result = controller.run(plan, is_synthetic=is_synthetic)
     finally:
         close_fn = getattr(evaluator, "close", None)
         if callable(close_fn):
             close_fn()
 
-    print(f"[{SYNTHETIC_LABEL}] Rollout finished with status: {result.final_status}")
+    summary_label = SYNTHETIC_LABEL if result.is_synthetic else OBSERVED_LABEL
+    print(f"[{summary_label}] Rollout finished with status: {result.final_status}")
     if result.post_rollback_verification is not None:
         v = result.post_rollback_verification
         print(f"Post-rollback verification: {v.summary} (verified={v.verified})")

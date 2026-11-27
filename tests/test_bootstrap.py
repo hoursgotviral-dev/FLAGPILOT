@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
-from flagpilot.bootstrap import BootstrapConfig, bootstrap_flagsmith
+from flagpilot.bootstrap import DEFAULT_PASSWORD, BootstrapConfig, bootstrap_flagsmith
 
 
 def _resp(payload: Any, status_code: int = 200) -> MagicMock:
@@ -156,4 +156,51 @@ def test_bootstrap_initial_and_idempotent_rerun(tmp_path: Path) -> None:
     assert "adm_master_1" not in out2.getvalue()
     assert "ser.srv_key_1" not in out2.getvalue()
     assert "hook-tok-1" not in out2.getvalue()
+
+
+def test_bootstrap_admin_password_env_override_and_redaction(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """FLAGPILOT_ADMIN_PASSWORD overrides BootstrapConfig default and is never printed or written."""
+    monkeypatch.delenv("FLAGPILOT_ADMIN_PASSWORD", raising=False)
+    assert BootstrapConfig().password == DEFAULT_PASSWORD
+
+    monkeypatch.setenv("FLAGPILOT_ADMIN_PASSWORD", "CustomAdminPass!99")
+    cfg = BootstrapConfig(base_url="http://localhost:8000", env_path=tmp_path / ".env")
+    assert cfg.password == "CustomAdminPass!99"
+    assert "CustomAdminPass!99" not in repr(cfg)
+
+    session = MagicMock()
+    session.headers = {}
+    session.request.side_effect = [
+        _resp({"status": "ok"}),
+        _resp({"self_hosted_data": {"has_users": False}}),
+        _resp({"key": "tok-custom"}, 201),
+        _resp([{"id": 10, "name": "FlagPilot Local"}]),
+        _resp({"key": "adm_custom"}, 201),
+        _resp([{"id": 20, "name": "FlagPilot Demo"}]),
+        _resp([{"id": 30, "name": "Development", "api_key": "cli_custom", "project": 20}]),
+        _resp({"key": "ser.custom"}, 201),
+        _resp([{"id": 40, "name": "checkout_v2"}]),
+        _resp([{"id": 50, "name": "flagpilot-checkout_v2-rollout"}]),
+        _resp({"id": 50, "name": "flagpilot-checkout_v2-rollout"}),
+        _resp([{"id": 30, "name": "Development", "api_key": "cli_custom"}]),
+        _resp([{"id": 40, "name": "checkout_v2"}]),
+        _resp({"environment_default": {"enabled": False, "value": None}, "segment_overrides": []}),
+        _resp(
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [{"segment": {"id": 50}, "priority": 0, "enabled": True}],
+            }
+        ),
+        _resp([]),
+        _resp({"name": "Grafana", "project": 20, "webhook_url": "http://localhost:8000/h/1/"}, 201),
+    ]
+    out = io.StringIO()
+    bootstrap_flagsmith(cfg, session=session, output_stream=out)
+    auth_call = session.request.call_args_list[2]
+    assert auth_call.kwargs["json"]["password"] == "CustomAdminPass!99"
+    assert "CustomAdminPass!99" not in out.getvalue()
+    assert "CustomAdminPass!99" not in (tmp_path / ".env").read_text(encoding="utf-8")
 
