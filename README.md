@@ -91,6 +91,21 @@ By default `flagpilot run` simulates error rates alongside persistent Flagsmith 
 
 When `--signal-url` or `--signal-file` is active, the external `OBSERVED` error rate is evaluated directly against `max_error_rate` at every stage (including `1%`, bypassing `min_samples` gating) while simulated identities are still evaluated separately; timeouts, HTTP failures, malformed payloads, or values outside `[0, 1]` fail closed and trigger rollback with the exact reason logged.
 
+### Live closed-loop canary demo
+
+With Flagsmith running and bootstrapped (`docker compose up -d` -> `flagpilot bootstrap`), run the Flagsmith-backed canary target ([`examples/checkout_service.py`](examples/checkout_service.py)) in a split terminal so `flagpilot` observes real HTTP 200/500 rates and auto-rolls back when breaches exceed `2%`:
+
+**Terminal 1 — Start live checkout service (`http://127.0.0.1:8085`):**
+```powershell
+.\tasks.ps1 demo-service          # macOS / Linux: make demo-service
+```
+
+**Terminal 2 — Run FlagPilot against `/health-rate` (type `APPROVE` once upfront):**
+```powershell
+.venv\Scripts\flagpilot.exe run --feature checkout_v2 --env Development --stages 1 10 50 100 --signal-url http://127.0.0.1:8085/health-rate --rollback-to-zero
+```
+*(On macOS/Linux, substitute `.venv/bin/flagpilot`. Pass `--fault-rate 0.15` to `checkout_service.py` if you want both `1%` and `10%` to pass before spiking at `50%`.)*
+
 ### What makes this hard to break
 
 | Failure Mode | How FlagPilot Handles It |
