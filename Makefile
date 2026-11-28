@@ -5,10 +5,10 @@ RUFF ?= .venv/bin/ruff
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install test lint smoke up bootstrap down demo demo-plan demo-apply demo-run demo-rollback demo-report
+.PHONY: help install test lint smoke up bootstrap down demo demo-plan demo-apply demo-run demo-rollback demo-report demo-service
 
 help:
-	@echo "Available targets: help install test lint smoke up bootstrap down demo-plan demo-apply demo-run demo-rollback demo-report demo"
+	@echo "Available targets: help install test lint smoke up bootstrap down demo-plan demo-apply demo-run demo-rollback demo-report demo-service demo"
 
 install:
 	python3 -m venv .venv
@@ -64,6 +64,9 @@ demo-rollback:
 
 demo-report:
 	$(FLAGPILOT) report --input reports/last_run.json --audit-log audit.log --out reports/rollout.html
+
+demo-service:
+	$(PYTHON) examples/checkout_service.py
 
 demo:
 	bash scripts/demo

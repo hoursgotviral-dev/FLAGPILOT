@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("help", "install", "test", "lint", "smoke", "up", "bootstrap", "down", "demo-plan", "demo-apply", "demo-run", "demo-rollback", "demo-report", "demo")]
+    [ValidateSet("help", "install", "test", "lint", "smoke", "up", "bootstrap", "down", "demo-plan", "demo-apply", "demo-run", "demo-rollback", "demo-report", "demo-service", "demo")]
     [string]$Task = "help"
 )
 
@@ -22,7 +22,7 @@ function Test-FlagsmithLive {
 
 switch ($Task) {
     "help" {
-        Write-Host "Available targets: help install test lint smoke up bootstrap down demo-plan demo-apply demo-run demo-rollback demo-report demo"
+        Write-Host "Available targets: help install test lint smoke up bootstrap down demo-plan demo-apply demo-run demo-rollback demo-report demo-service demo"
     }
     "install" {
         python -m venv .venv
@@ -86,6 +86,10 @@ switch ($Task) {
     "demo-report" {
         Write-Host "=== [5/5] REPORT (static reports/rollout.html from audit.log + reports/last_run.json) ==="
         & $FlagPilot report --input reports/last_run.json --audit-log audit.log --out reports/rollout.html
+    }
+    "demo-service" {
+        Write-Host "Starting Flagsmith-backed closed-loop checkout canary service on http://127.0.0.1:8085 ..."
+        & $Python examples/checkout_service.py
     }
     "demo" {
         Write-Host "=== [0/5] ENSURE FLAGSMITH IS UP ==="
