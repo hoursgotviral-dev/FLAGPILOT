@@ -21,6 +21,7 @@ lint:
 	$(RUFF) check src tests
 
 smoke:
+	$(FLAGPILOT) bootstrap --wait-only
 	FLAGPILOT_LIVE_TEST=1 $(PYTEST) -m live -v
 
 up:

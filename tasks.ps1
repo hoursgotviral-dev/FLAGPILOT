@@ -35,6 +35,8 @@ switch ($Task) {
         & $Ruff check src tests
     }
     "smoke" {
+        & $FlagPilot bootstrap --wait-only
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         $env:FLAGPILOT_LIVE_TEST = "1"
         try {
             & $Pytest -m live -v
@@ -93,6 +95,9 @@ switch ($Task) {
         if (-not (Test-Path ".env")) {
             Write-Host "=== [0.5/5] BOOTSTRAP LOCAL FLAGSMITH (.env missing) ==="
             & $MyInvocation.MyCommand.Path bootstrap
+        } else {
+            & $FlagPilot bootstrap --wait-only
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         }
         & $MyInvocation.MyCommand.Path demo-plan
         & $MyInvocation.MyCommand.Path demo-apply

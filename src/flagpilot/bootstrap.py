@@ -52,8 +52,9 @@ class BootstrapConfig:
     segment_name: str = DEFAULT_SEGMENT_NAME
     env_path: Path = Path(".env")
     timeout_seconds: float = 10.0
-    liveness_timeout_seconds: float = 120.0
+    liveness_timeout_seconds: float = 300.0
     poll_interval_seconds: float = 2.0
+    progress_interval_seconds: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -181,14 +182,19 @@ def wait_for_liveness(
     session: requests.Session,
     base_url: str,
     *,
-    timeout_seconds: float = 120.0,
+    timeout_seconds: float = 300.0,
     poll_interval_seconds: float = 2.0,
+    progress_interval_seconds: float = 15.0,
     sleep_fn: Callable[[float], None] = time.sleep,
     monotonic_fn: Callable[[], float] = time.monotonic,
+    output_stream: Any = None,
 ) -> None:
     """Poll ``<base_url>/health/liveness/`` until HTTP 200 is returned."""
+    out = output_stream if output_stream is not None else sys.stdout
     liveness_url = f"{base_url.rstrip('/')}/health/liveness/"
-    deadline = monotonic_fn() + timeout_seconds
+    start = monotonic_fn()
+    deadline = start + timeout_seconds
+    next_progress = progress_interval_seconds
     last_error = "no response yet"
     while True:
         try:
@@ -199,10 +205,21 @@ def wait_for_liveness(
         except requests.RequestException as exc:
             last_error = str(exc)
 
-        if monotonic_fn() >= deadline:
+        now = monotonic_fn()
+        if now >= deadline:
             raise BootstrapError(
-                f"Timed out waiting for {liveness_url} after {timeout_seconds:.0f}s: {last_error}"
+                f"Timed out waiting for {liveness_url} after {timeout_seconds:.0f}s "
+                f"(first start / database migration can take a few minutes): {last_error}"
             )
+        elapsed = now - start
+        if progress_interval_seconds > 0 and elapsed >= next_progress:
+            out.write(
+                f"Waiting for Flagsmith to start, first start can take a few minutes ({elapsed:.0f}s)...\n"
+            )
+            if hasattr(out, "flush"):
+                out.flush()
+            while next_progress <= elapsed:
+                next_progress += progress_interval_seconds
         sleep_fn(poll_interval_seconds)
 
 
@@ -309,8 +326,10 @@ def bootstrap_flagsmith(
         base,
         timeout_seconds=config.liveness_timeout_seconds,
         poll_interval_seconds=config.poll_interval_seconds,
+        progress_interval_seconds=config.progress_interval_seconds,
         sleep_fn=sleep_fn,
         monotonic_fn=monotonic_fn,
+        output_stream=out,
     )
     out.write(f"Flagsmith liveness OK at {base}/health/liveness/\n")
 
@@ -574,6 +593,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--env-name", default=DEFAULT_ENV_NAME)
     parser.add_argument("--feature-name", default=DEFAULT_FEATURE_NAME)
     parser.add_argument("--segment-name", default=DEFAULT_SEGMENT_NAME)
+    parser.add_argument(
+        "--wait-only",
+        action="store_true",
+        help="Wait for Flagsmith /health/liveness/ up to 300s without provisioning.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     cfg = BootstrapConfig(
@@ -586,7 +610,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         segment_name=args.segment_name,
     )
     try:
-        bootstrap_flagsmith(cfg)
+        if args.wait_only:
+            wait_for_liveness(
+                requests.Session(),
+                cfg.base_url,
+                timeout_seconds=cfg.liveness_timeout_seconds,
+                poll_interval_seconds=cfg.poll_interval_seconds,
+                progress_interval_seconds=cfg.progress_interval_seconds,
+            )
+            print(f"Flagsmith liveness OK at {cfg.base_url.rstrip('/')}/health/liveness/")
+        else:
+            bootstrap_flagsmith(cfg)
     except BootstrapError as exc:
         print(f"Bootstrap error: {exc}", file=sys.stderr)
         return 1

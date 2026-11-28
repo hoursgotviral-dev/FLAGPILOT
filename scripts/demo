@@ -42,12 +42,7 @@ is_flagsmith_live() {
 echo "=== [0/5] ENSURE FLAGSMITH IS UP ==="
 if ! is_flagsmith_live; then
   docker compose up -d
-  for _ in $(seq 1 30); do
-    if is_flagsmith_live; then
-      break
-    fi
-    sleep 2
-  done
+  "$FLAGPILOT_BIN" bootstrap --wait-only
 fi
 
 if [[ ! -f ".env" ]]; then
