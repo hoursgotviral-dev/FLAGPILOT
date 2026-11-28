@@ -41,7 +41,7 @@ class Decision:
     reason: str
     current_percentage: int
     next_percentage: int | None = None
-    observed_error_rate: float = 0.0
+    observed_error_rate: float | None = 0.0
     sample_count: int = 0
 
 
@@ -67,6 +67,7 @@ class StageMetrics:
     source_label: str = "SYNTHETIC DATA"
     reported_error_rate: float | None = None
     exposed_identities: tuple[str, ...] | None = None
+    signal_error: str | None = None
 
     @property
     def error_rate(self) -> float:

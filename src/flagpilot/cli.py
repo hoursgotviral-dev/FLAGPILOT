@@ -8,6 +8,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 
 from flagpilot.apply import ApprovalDeniedError, ApprovedFlagsmithWriter
@@ -21,12 +22,14 @@ from flagpilot.bootstrap import (
     BootstrapConfig,
     BootstrapError,
     bootstrap_flagsmith,
+    wait_for_liveness,
 )
 from flagpilot.controller import (
     OBSERVED_LABEL,
     FileSignalProvider,
     HttpSignalProvider,
     RolloutController,
+    SignalCollectionError,
     StageSignalProvider,
     execute_manual_rollback,
 )
@@ -119,7 +122,20 @@ class _CompositeExternalSignalProvider:
         if isinstance(self._evaluator, OfflineFakeEvaluator):
             self._evaluator.set_percentage(step.percentage)
         round_result = self._simulator.run_round(plan.feature_name)
-        external = self._external_provider.collect(plan, step)
+        try:
+            external = self._external_provider.collect(plan, step)
+        except SignalCollectionError as exc:
+            partial = StageMetrics(
+                percentage=step.percentage,
+                sample_count=round_result.total_count,
+                error_count=0,
+                enabled_count=round_result.exposed_count,
+                source_label=OBSERVED_LABEL,
+                reported_error_rate=None,
+                exposed_identities=round_result.exposed_identities,
+                signal_error=str(exc),
+            )
+            raise SignalCollectionError(str(exc), partial_metrics=partial) from exc
         if self._verbose:
             print(
                 f"[{external.source_label} | {SYNTHETIC_LABEL} identities] "
@@ -218,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--env-name", default=DEFAULT_ENV_NAME)
     bootstrap_parser.add_argument("--feature-name", default=DEFAULT_FEATURE_NAME)
     bootstrap_parser.add_argument("--segment-name", default=DEFAULT_SEGMENT_NAME)
+    bootstrap_parser.add_argument(
+        "--wait-only",
+        action="store_true",
+        help="Wait up to 300s for /health/liveness/ and exit without provisioning",
+    )
 
     plan_parser = subparsers.add_parser("plan", help="Generate a deterministic rollout plan")
     plan_parser.add_argument(
@@ -374,6 +395,16 @@ def _handle_bootstrap(args: argparse.Namespace) -> int:
         feature_name=args.feature_name,
         segment_name=args.segment_name,
     )
+    if args.wait_only:
+        wait_for_liveness(
+            requests.Session(),
+            cfg.base_url,
+            timeout_seconds=cfg.liveness_timeout_seconds,
+            poll_interval_seconds=cfg.poll_interval_seconds,
+            progress_interval_seconds=cfg.progress_interval_seconds,
+        )
+        print(f"Flagsmith liveness OK at {cfg.base_url.rstrip('/')}/health/liveness/")
+        return 0
     bootstrap_flagsmith(cfg)
     return 0
 
@@ -434,7 +465,7 @@ def _handle_apply(args: argparse.Namespace) -> int:
 def _handle_run(args: argparse.Namespace) -> int:
     plan = _resolve_plan(args)
     backend = FlagsmithManagementClient(FlagsmithConfig.from_env())
-    writer = ApprovedFlagsmithWriter(backend)
+    writer = ApprovedFlagsmithWriter(backend, audit_log_path=args.audit_log)
     evaluator: FlagEvaluator = (
         OfflineFakeEvaluator() if args.offline_evaluator else FlagsmithSDKEvaluator.from_env()
     )
