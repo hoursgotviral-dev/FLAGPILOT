@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from flagpilot.planner import plan_from_dict, plan_to_dict
 from flagpilot.types import (
     Decision,
     MonotonicityCheck,
+    Plan,
     PostRollbackVerification,
     RolloutRunResult,
     StageMetrics,
@@ -114,6 +116,11 @@ def run_result_to_dict(result: RolloutRunResult) -> dict[str, Any]:
                     "source_label": outcome.metrics.source_label,
                     "reported_error_rate": outcome.metrics.reported_error_rate,
                     **(
+                        {"signal_error": outcome.metrics.signal_error}
+                        if outcome.metrics.signal_error is not None
+                        else {}
+                    ),
+                    **(
                         {"exposed_identities": list(outcome.metrics.exposed_identities)}
                         if outcome.metrics.exposed_identities is not None
                         else {}
@@ -160,6 +167,7 @@ def run_result_from_dict(data: dict[str, Any]) -> RolloutRunResult:
                     enabled_count=metrics_data["enabled_count"],
                     source_label=metrics_data.get("source_label", "SYNTHETIC DATA"),
                     reported_error_rate=metrics_data.get("reported_error_rate"),
+                    signal_error=metrics_data.get("signal_error"),
                     exposed_identities=(
                         tuple(str(x) for x in raw_identities)
                         if isinstance(raw_identities, list)
@@ -243,6 +251,29 @@ def _match_audit_times(
     return times
 
 
+def _format_utc_timestamp(raw_timestamp: str) -> str:
+    """Format an ISO-8601 timestamp into a single-line ``YYYY-MM-DD HH:MM:SS UTC`` string."""
+    cleaned = raw_timestamp.strip()
+    if not cleaned or cleaned == "—":
+        return "—"
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return cleaned
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _format_threshold_summary(plan: Plan) -> str:
+    if not plan.steps:
+        return "—"
+    rates = {step.max_error_rate for step in plan.steps}
+    if len(rates) == 1:
+        return f"{plan.steps[0].max_error_rate:.2%}"
+    return " / ".join(f"{step.percentage}%: {step.max_error_rate:.2%}" for step in plan.steps)
+
+
 def _render_svg_chart(result: RolloutRunResult) -> str:
     """Render an inline SVG chart plotting exposure (%) and error rate (%) per step."""
     width = 760
@@ -262,19 +293,20 @@ def _render_svg_chart(result: RolloutRunResult) -> str:
             "No rollout steps recorded</text></svg>"
         )
 
-    exposures: list[float] = []
-    error_rates: list[float] = []
+    exposures: list[float | None] = []
+    error_rates: list[float | None] = []
     labels: list[str] = []
     for outcome in outcomes:
         m = outcome.metrics
-        exp_pct = (m.enabled_count / m.sample_count * 100.0) if m.sample_count > 0 else 0.0
-        err_pct = m.error_rate * 100.0
+        exp_pct = (m.enabled_count / m.sample_count * 100.0) if m.sample_count > 0 else None
+        err_pct = None if m.signal_error is not None else (m.error_rate * 100.0)
         exposures.append(exp_pct)
         error_rates.append(err_pct)
         labels.append(f"{outcome.step.percentage}%")
 
+    valid_err_pcts = [err for err in error_rates if err is not None]
     max_err_pct = max(
-        [o.step.max_error_rate * 100.0 for o in outcomes] + error_rates + [5.0]
+        [o.step.max_error_rate * 100.0 for o in outcomes] + valid_err_pcts + [5.0]
     )
     err_scale_max = max(5.0, round(max_err_pct * 1.25, 1))
 
@@ -316,21 +348,34 @@ def _render_svg_chart(result: RolloutRunResult) -> str:
             f'class="axis-text err-axis">{err_tick:.1f}%</text>'
         )
 
-    # Threshold dashed line
-    threshold_pct = outcomes[0].step.max_error_rate * 100.0
-    th_y = y_err(threshold_pct)
-    svg_parts.append(
-        f'<line x1="{pad_left}" y1="{th_y:.1f}" x2="{width - pad_right}" y2="{th_y:.1f}" '
-        'class="threshold-line" />'
-    )
-    svg_parts.append(
-        f'<text x="{width - pad_right - 4}" y="{th_y - 6:.1f}" text-anchor="end" '
-        f'class="threshold-label">Threshold {threshold_pct:.1f}%</text>'
-    )
+    # Threshold dashed line (flat when uniform, per-step polyline when varied)
+    step_thresholds = [o.step.max_error_rate * 100.0 for o in outcomes]
+    if len(set(step_thresholds)) <= 1:
+        threshold_pct = step_thresholds[0]
+        th_y = y_err(threshold_pct)
+        svg_parts.append(
+            f'<line x1="{pad_left}" y1="{th_y:.1f}" x2="{width - pad_right}" y2="{th_y:.1f}" '
+            'class="threshold-line" />'
+        )
+        svg_parts.append(
+            f'<text x="{width - pad_right - 4}" y="{th_y - 6:.1f}" text-anchor="end" '
+            f'class="threshold-label">Threshold {threshold_pct:.1f}%</text>'
+        )
+    else:
+        th_pts = " ".join(
+            f"{x:.1f},{y_err(th):.1f}" for x, th in zip(x_positions, step_thresholds, strict=True)
+        )
+        svg_parts.append(f'<polyline points="{th_pts}" class="threshold-line" style="fill:none;" />')
+        svg_parts.append(
+            f'<text x="{width - pad_right - 4}" y="{y_err(step_thresholds[-1]) - 6:.1f}" '
+            'text-anchor="end" class="threshold-label">Per-Step Threshold</text>'
+        )
 
     # Exposure bars
     bar_w = min(44.0, (plot_w / max(count, 1)) * 0.35)
     for x, exp_val, label in zip(x_positions, exposures, labels, strict=True):
+        if exp_val is None:
+            continue
         bar_y = y_exp(exp_val)
         bar_h = (pad_top + plot_h) - bar_y
         svg_parts.append(
@@ -340,25 +385,29 @@ def _render_svg_chart(result: RolloutRunResult) -> str:
         )
 
     # Exposure polyline
-    if count > 1:
-        exp_pts = " ".join(
-            f"{x:.1f},{y_exp(v):.1f}" for x, v in zip(x_positions, exposures, strict=True)
-        )
+    valid_exp_pairs = [(x, v) for x, v in zip(x_positions, exposures, strict=True) if v is not None]
+    if len(valid_exp_pairs) > 1:
+        exp_pts = " ".join(f"{x:.1f},{y_exp(v):.1f}" for x, v in valid_exp_pairs)
         svg_parts.append(f'<polyline points="{exp_pts}" class="exp-line" />')
 
-    # Error rate polyline + markers
-    if count > 1:
-        err_pts = " ".join(
-            f"{x:.1f},{y_err(v):.1f}" for x, v in zip(x_positions, error_rates, strict=True)
-        )
+    # Error rate polyline + markers (omit failed signal ticks rather than plotting fake 100%)
+    valid_err_pairs = [(x, v) for x, v in zip(x_positions, error_rates, strict=True) if v is not None]
+    if len(valid_err_pairs) > 1:
+        err_pts = " ".join(f"{x:.1f},{y_err(v):.1f}" for x, v in valid_err_pairs)
         svg_parts.append(f'<polyline points="{err_pts}" class="err-line" />')
 
     for x, err_val, label in zip(x_positions, error_rates, labels, strict=True):
-        cy = y_err(err_val)
-        svg_parts.append(
-            f'<circle cx="{x:.1f}" cy="{cy:.1f}" r="5" class="err-dot">'
-            f"<title>Step {html.escape(label)}: Error rate {err_val:.2f}%</title></circle>"
-        )
+        if err_val is not None:
+            cy = y_err(err_val)
+            svg_parts.append(
+                f'<circle cx="{x:.1f}" cy="{cy:.1f}" r="5" class="err-dot">'
+                f"<title>Step {html.escape(label)}: Error rate {err_val:.2f}%</title></circle>"
+            )
+        else:
+            svg_parts.append(
+                f'<text x="{x:.1f}" y="{pad_top + 16}" text-anchor="middle" '
+                'class="threshold-label">N/A (signal error)</text>'
+            )
         svg_parts.append(
             f'<text x="{x:.1f}" y="{height - 18}" text-anchor="middle" class="axis-text">'
             f"{html.escape(label)}</text>"
@@ -390,7 +439,8 @@ def render_html_report(
     """Render a self-contained HTML rollout report with inline CSS, SVG chart, and light/dark."""
     plan = result.plan
     stages_str = " → ".join(f"{step.percentage}%" for step in plan.steps)
-    threshold_str = f"{plan.steps[0].max_error_rate:.2%}" if plan.steps else "—"
+    threshold_str = _format_threshold_summary(plan)
+    has_varied_thresholds = len({step.max_error_rate for step in plan.steps}) > 1
     matched_times = _match_audit_times(result.outcomes, audit_entries)
 
     # Determine rollback banner reason from outcomes or audit.log
@@ -447,8 +497,22 @@ def render_html_report(
     for outcome, timestamp in zip(result.outcomes, matched_times, strict=True):
         m = outcome.metrics
         d = outcome.decision
-        exposed_pct = (m.enabled_count / m.sample_count * 100.0) if m.sample_count > 0 else 0.0
-        badge_cls = "badge-danger" if d.action == "rollback" else "badge-ok"
+        if m.sample_count > 0:
+            exposed_pct = m.enabled_count / m.sample_count * 100.0
+            exposed_cell = f"{m.enabled_count} / {m.sample_count} ({exposed_pct:.1f}%)"
+        else:
+            exposed_cell = '<span class="muted">N/A (signal error)</span>'
+
+        if m.signal_error is not None:
+            err_cell = '<span class="badge badge-danger">N/A (signal error)</span>'
+        elif has_varied_thresholds:
+            err_cell = f"{m.error_rate:.2%} (max {outcome.step.max_error_rate:.2%})"
+        else:
+            err_cell = f"{m.error_rate:.2%}"
+
+        badge_cls = (
+            "badge-danger" if d.action in ("rollback", "pause", "hold") else "badge-ok"
+        )
         ret = outcome.retained_from_previous_stage
         if ret is None:
             ret_cell = '<span class="muted">—</span>'
@@ -467,12 +531,12 @@ def render_html_report(
         step_rows.append(
             "<tr>"
             f"<td>{outcome.step.percentage}%</td>"
-            f"<td>{m.enabled_count} / {m.sample_count} ({exposed_pct:.1f}%)</td>"
-            f"<td>{m.error_rate:.2%}</td>"
+            f"<td>{exposed_cell}</td>"
+            f"<td>{err_cell}</td>"
             f"<td>{ret_cell}</td>"
             f'<td><span class="badge {badge_cls}">{html.escape(d.action)}</span> '
             f'<span class="muted">{html.escape(d.reason)}</span></td>'
-            f'<td class="mono">{html.escape(timestamp)}</td>'
+            f'<td class="mono">{html.escape(_format_utc_timestamp(timestamp))}</td>'
             "</tr>"
         )
 
@@ -500,7 +564,7 @@ def render_html_report(
             action_cell = f'<span class="badge {v_badge}">verified 0%</span>'
         audit_rows.append(
             "<tr>"
-            f'<td class="mono">{html.escape(str(entry.get("timestamp", "")))}</td>'
+            f'<td class="mono">{html.escape(_format_utc_timestamp(str(entry.get("timestamp", ""))))}</td>'
             f"<td>{action_cell}</td>"
             f"<td>{html.escape(change_text)}</td>"
             f"<td>{html.escape(str(entry.get('reason', '')))}</td>"
@@ -565,7 +629,7 @@ def render_html_report(
     if proof_items:
         proof_section = (
             '<section class="card">'
-            "<h2>Monotonic Enrollment Proof &amp; Rollback Verification</h2>"
+            "<h2>Monotonicity Check &amp; Rollback Verification</h2>"
             f'<ul style="margin:0;padding-left:1.25rem;display:grid;gap:0.45rem;">{"".join(proof_items)}</ul>'
             "</section>"
         )
@@ -711,7 +775,7 @@ def render_html_report(
     }}
     .summary-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(3, 1fr);
       gap: 0.75rem;
     }}
     .kv {{ padding: 0.65rem 0.75rem; border: 1px solid var(--border); border-radius: 8px; }}
@@ -721,7 +785,7 @@ def render_html_report(
     table {{ width: 100%; border-collapse: collapse; font-size: 0.92rem; }}
     th, td {{ text-align: left; padding: 0.65rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; }}
     th {{ color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; white-space: nowrap; }}
     .muted {{ color: var(--muted); font-size: 0.85rem; }}
     .badge {{
       display: inline-block;
@@ -863,9 +927,15 @@ def render_markdown_report(result: RolloutRunResult) -> str:
     for outcome in result.outcomes:
         m = outcome.metrics
         d = outcome.decision
+        samples_str = str(m.sample_count) if m.sample_count > 0 else "N/A"
+        enabled_str = str(m.enabled_count) if m.sample_count > 0 else "N/A"
+        err_count_str = str(m.error_count) if m.signal_error is None else "N/A"
+        rate_str = (
+            "N/A (signal error)" if m.signal_error is not None else f"{m.error_rate:.2%}"
+        )
         lines.append(
-            f"| {outcome.step.percentage}% | {m.sample_count} | {m.enabled_count} | "
-            f"{m.error_count} | {m.error_rate:.2%} | {m.source_label} | "
+            f"| {outcome.step.percentage}% | {samples_str} | {enabled_str} | "
+            f"{err_count_str} | {rate_str} | {m.source_label} | "
             f"`{d.action}` | {d.reason} |"
         )
     return "\n".join(lines) + "\n"

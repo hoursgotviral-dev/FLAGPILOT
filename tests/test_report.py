@@ -112,7 +112,9 @@ def test_report_subcommand_generates_static_html_from_fake_run_and_audit_log(
     assert "100 / 200 (50.0%)" in html_doc
     assert "<svg " in html_doc
     assert "<polyline" in html_doc
-    assert "+00:00" in html_doc
+    assert " UTC" in html_doc
+    assert "grid-template-columns: repeat(3, 1fr);" in html_doc
+    assert "white-space: nowrap;" in html_doc
     assert "Feature Health" in html_doc
 
 
@@ -248,8 +250,86 @@ def test_report_includes_monotonicity_and_post_rollback_verification(tmp_path: P
         ]
     )
     html_doc = html_path.read_text(encoding="utf-8")
-    assert "Monotonic Enrollment" in html_doc
+    assert "Monotonicity Check &amp; Rollback Verification" in html_doc
+    assert "Monotonic Enrollment Proof" not in html_doc
     assert "Verified (100% retained across 2 step-up(s))" in html_doc
     assert "Verified: 0/200 exposed identities after rollback to 0%" in html_doc
     assert "Zero-Exposure Confirmed" in html_doc
+
+
+def test_report_renders_signal_error_and_varied_step_thresholds(tmp_path: Path) -> None:
+    """Signal collection failures render as N/A (not 0/0 and 100%), and differing step limits show cleanly."""
+    from flagpilot.types import Decision, RolloutRunResult, StageOutcome, Step
+
+    plan = Plan(
+        feature_name="checkout_v2",
+        environment="Development",
+        steps=(
+            Step(percentage=1, min_samples=20, max_error_rate=0.01),
+            Step(percentage=10, min_samples=20, max_error_rate=0.02),
+        ),
+    )
+    run_result = RolloutRunResult(
+        plan=plan,
+        final_status="rolled_back",
+        rollback_applied=True,
+        rollback_to_percentage=0,
+        is_synthetic=False,
+        outcomes=(
+            StageOutcome(
+                step=plan.steps[0],
+                metrics=StageMetrics(
+                    percentage=1,
+                    sample_count=200,
+                    error_count=0,
+                    enabled_count=3,
+                    source_label="OBSERVED",
+                    reported_error_rate=0.005,
+                ),
+                decision=Decision(
+                    action="advance",
+                    reason="Error rate 0.50% within threshold 1.00%.",
+                    current_percentage=1,
+                    next_percentage=10,
+                    observed_error_rate=0.005,
+                    sample_count=200,
+                ),
+                applied=True,
+            ),
+            StageOutcome(
+                step=plan.steps[1],
+                metrics=StageMetrics(
+                    percentage=10,
+                    sample_count=200,
+                    error_count=0,
+                    enabled_count=24,
+                    source_label="OBSERVED",
+                    reported_error_rate=None,
+                    signal_error="HTTP 503",
+                ),
+                decision=Decision(
+                    action="rollback",
+                    reason="Signal collection failed (fail-closed): HTTP 503; rolling back to 0%.",
+                    current_percentage=10,
+                    next_percentage=0,
+                    observed_error_rate=None,
+                    sample_count=200,
+                ),
+                applied=True,
+            ),
+        ),
+    )
+
+    out_html = tmp_path / "signal_err.html"
+    from flagpilot.report import save_html_report
+
+    save_html_report(run_result, out_html)
+    doc = out_html.read_text(encoding="utf-8")
+    assert "1%: 1.00% / 10%: 2.00%" in doc
+    assert "24 / 200 (12.0%)" in doc
+    assert "N/A (signal error)" in doc
+    assert "100.00%" not in doc
+
+    md = render_markdown_report(run_result)
+    assert "N/A (signal error)" in md
 

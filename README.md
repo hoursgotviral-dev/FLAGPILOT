@@ -123,6 +123,8 @@ docker compose up -d
 
 During `scripts/demo` / `.\tasks.ps1 demo`, type `APPROVE` interactively when prompted (`apply`, one-shot upfront policy `APPROVE` for `run` with `--rollback-to-zero`, and cleanup `rollback` reset); after completion, open `reports/rollout.html` in any browser.
 
+> **Note:** On a fresh database, Flagsmith's initial startup (`migrate-db`) takes about 2 to 3 minutes. `flagpilot bootstrap` and the `smoke`/`demo` task runners automatically wait up to 300 seconds for `/health/liveness/` before continuing.
+
 ## Repository map
 
 ```text

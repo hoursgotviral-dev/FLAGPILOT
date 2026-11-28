@@ -5,9 +5,19 @@ from __future__ import annotations
 import io
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from flagpilot.bootstrap import DEFAULT_PASSWORD, BootstrapConfig, bootstrap_flagsmith
+import pytest
+import requests
+
+from flagpilot.bootstrap import (
+    DEFAULT_PASSWORD,
+    BootstrapConfig,
+    BootstrapError,
+    bootstrap_flagsmith,
+    main,
+    wait_for_liveness,
+)
 
 
 def _resp(payload: Any, status_code: int = 200) -> MagicMock:
@@ -203,4 +213,59 @@ def test_bootstrap_admin_password_env_override_and_redaction(
     assert auth_call.kwargs["json"]["password"] == "CustomAdminPass!99"
     assert "CustomAdminPass!99" not in out.getvalue()
     assert "CustomAdminPass!99" not in (tmp_path / ".env").read_text(encoding="utf-8")
+
+
+def test_wait_for_liveness_progress_and_timeout() -> None:
+    """wait_for_liveness prints periodic progress every 15s, succeeds at 200, and times out at 300s."""
+    now = [0.0]
+
+    def _monotonic() -> float:
+        return now[0]
+
+    def _sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    # 1. Transient errors for ~32s -> prints periodic lines at 15s and 30s, then succeeds
+    sess_ok = MagicMock()
+    sess_ok.request.side_effect = [
+        requests.ConnectionError("starting"),
+        _resp(None, 503),
+        _resp(None, 503),
+        _resp({"status": "ok"}, 200),
+    ]
+    out_ok = io.StringIO()
+    wait_for_liveness(
+        sess_ok,
+        "http://localhost:8000",
+        timeout_seconds=300.0,
+        poll_interval_seconds=16.0,
+        progress_interval_seconds=15.0,
+        sleep_fn=_sleep,
+        monotonic_fn=_monotonic,
+        output_stream=out_ok,
+    )
+    progress_lines = [line for line in out_ok.getvalue().splitlines() if line.strip()]
+    assert len(progress_lines) == 2
+    assert all("Waiting for Flagsmith to start" in line for line in progress_lines)
+
+    # 2. Exceeds default 300s timeout -> raises BootstrapError
+    now[0] = 0.0
+    sess_timeout = MagicMock()
+    sess_timeout.request.side_effect = requests.ConnectionError("still migrating")
+    with pytest.raises(BootstrapError, match="300s"):
+        wait_for_liveness(
+            sess_timeout,
+            "http://localhost:8000",
+            poll_interval_seconds=150.0,
+            progress_interval_seconds=15.0,
+            sleep_fn=_sleep,
+            monotonic_fn=_monotonic,
+            output_stream=io.StringIO(),
+        )
+
+    # 3. python -m flagpilot.bootstrap --wait-only invokes wait_for_liveness without full bootstrap
+    with patch("flagpilot.bootstrap.wait_for_liveness") as mock_wait:
+        assert main(["--wait-only", "--base-url", "http://localhost:8000"]) == 0
+    mock_wait.assert_called_once()
+    assert mock_wait.call_args.kwargs["timeout_seconds"] == 300.0
 

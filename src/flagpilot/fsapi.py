@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -146,6 +147,42 @@ class FlagsmithManagementClient:
     def _ensure_trailing_slash(path: str) -> str:
         return path if path.endswith("/") else f"{path}/"
 
+    def _request_url(
+        self,
+        method: str,
+        url: str,
+        *,
+        label: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        try:
+            response = self._session.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_body,
+                timeout=self._timeout,
+            )
+        except requests.RequestException as exc:
+            safe_exc = _sanitize_secrets(str(exc), self._secrets)
+            raise FlagsmithAPIError(
+                f"Flagsmith Management API {method} {label} request error: {safe_exc}"
+            ) from None
+
+        if not response.ok:
+            safe_body = _sanitize_secrets(response.text or "", self._secrets)
+            raise FlagsmithAPIError(
+                f"Flagsmith Management API {method} {label} failed "
+                f"(HTTP {response.status_code}): {safe_body}",
+                status_code=response.status_code,
+                response_body=safe_body,
+            )
+
+        if response.status_code == 204 or not response.text.strip():
+            return None
+        return response.json()
+
     def _request(
         self,
         method: str,
@@ -159,33 +196,38 @@ class FlagsmithManagementClient:
             url = f"{self._root_url}{normalized_path}"
         else:
             url = f"{self._base_url}{normalized_path}"
+        return self._request_url(
+            method,
+            url,
+            label=normalized_path,
+            params=params,
+            json_body=json_body,
+        )
 
-        try:
-            response = self._session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_body,
-                timeout=self._timeout,
+    def _iter_paginated_results(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield items across Flagsmith DRF paginated responses following ``next`` links."""
+        payload = self._request("GET", path, params=params)
+        yield from self._extract_results(payload)
+        seen_urls: set[str] = set()
+        while isinstance(payload, dict) and payload.get("next"):
+            raw_next = str(payload["next"]).strip()
+            if not raw_next:
+                break
+            next_url = (
+                raw_next
+                if raw_next.startswith(("http://", "https://"))
+                else f"{self._root_url}{raw_next.lstrip('/')}"
             )
-        except requests.RequestException as exc:
-            safe_exc = _sanitize_secrets(str(exc), self._secrets)
-            raise FlagsmithAPIError(
-                f"Flagsmith Management API {method} {normalized_path} request error: {safe_exc}"
-            ) from None
-
-        if not response.ok:
-            safe_body = _sanitize_secrets(response.text or "", self._secrets)
-            raise FlagsmithAPIError(
-                f"Flagsmith Management API {method} {normalized_path} failed "
-                f"(HTTP {response.status_code}): {safe_body}",
-                status_code=response.status_code,
-                response_body=safe_body,
-            )
-
-        if response.status_code == 204 or not response.text.strip():
-            return None
-        return response.json()
+            if next_url in seen_urls:
+                break
+            seen_urls.add(next_url)
+            payload = self._request_url("GET", next_url, label=path)
+            yield from self._extract_results(payload)
 
     @staticmethod
     def _extract_results(payload: Any) -> list[dict[str, Any]]:
@@ -250,8 +292,7 @@ class FlagsmithManagementClient:
         return dict(payload)
 
     def _find_feature(self, project_id: int, feature_name: str) -> dict[str, Any] | None:
-        payload = self._request("GET", f"projects/{project_id}/features/")
-        for feat in self._extract_results(payload):
+        for feat in self._iter_paginated_results(f"projects/{project_id}/features/"):
             if feat.get("name") == feature_name:
                 return feat
         return None
@@ -291,16 +332,50 @@ class FlagsmithManagementClient:
         return dict(payload)
 
     @staticmethod
+    def _override_segment_id(override: dict[str, Any]) -> int | None:
+        seg = override.get("segment")
+        raw_id = seg.get("id") if isinstance(seg, dict) else seg
+        return int(raw_id) if raw_id is not None else None
+
+    @classmethod
     def _find_segment_override(
+        cls,
         future_state: dict[str, Any],
         segment_id: int,
     ) -> dict[str, Any] | None:
         for override in future_state.get("segment_overrides", []):
-            seg = override.get("segment")
-            seg_id = seg.get("id") if isinstance(seg, dict) else seg
-            if seg_id == segment_id:
+            if cls._override_segment_id(override) == segment_id:
                 return dict(override)
         return None
+
+    @classmethod
+    def _merge_segment_overrides(
+        cls,
+        existing_overrides: Sequence[dict[str, Any]],
+        segment_id: int,
+        target_override: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Update/insert ``target_override`` while preserving other segment overrides."""
+        merged: list[dict[str, Any]] = []
+        replaced = False
+        for entry in existing_overrides:
+            other_id = cls._override_segment_id(entry)
+            if other_id == segment_id:
+                if not replaced:
+                    merged.append(target_override)
+                    replaced = True
+            elif other_id is not None:
+                merged.append(
+                    {
+                        "segment": {"id": other_id},
+                        "enabled": bool(entry.get("enabled", False)),
+                        "priority": entry.get("priority", 0),
+                        "value": entry.get("value"),
+                    }
+                )
+        if not replaced:
+            merged.append(target_override)
+        return merged
 
     def create_feature(
         self,
@@ -345,9 +420,12 @@ class FlagsmithManagementClient:
         validated_percent = _validate_percentage(percent)
         resolved_project = self.resolve_project_id(project_id)
 
-        payload = self._request("GET", f"projects/{resolved_project}/segments/")
         existing = next(
-            (seg for seg in self._extract_results(payload) if seg.get("name") == clean_name),
+            (
+                seg
+                for seg in self._iter_paginated_results(f"projects/{resolved_project}/segments/")
+                if seg.get("name") == clean_name
+            ),
             None,
         )
         body = {
@@ -420,19 +498,21 @@ class FlagsmithManagementClient:
         current = self._get_future_feature_state(env_api_key, feature_id)
         existing = self._find_segment_override(current, segment_id)
 
+        target_override = {
+            "segment": {"id": segment_id},
+            "enabled": enabled,
+            "priority": existing.get("priority", priority) if existing else priority,
+            "value": existing.get("value") if existing else None,
+        }
+        merged_overrides = self._merge_segment_overrides(
+            current.get("segment_overrides", []),
+            segment_id,
+            target_override,
+        )
         updated = self._patch_future_feature_state(
             env_api_key,
             feature_id,
-            {
-                "segment_overrides": [
-                    {
-                        "segment": {"id": segment_id},
-                        "enabled": enabled,
-                        "priority": existing.get("priority", priority) if existing else priority,
-                        "value": existing.get("value") if existing else None,
-                    }
-                ]
-            },
+            {"segment_overrides": merged_overrides},
         )
         result = self._find_segment_override(updated, segment_id)
         if result is None:
@@ -470,19 +550,21 @@ class FlagsmithManagementClient:
                 f"No feature state found for feature {feature_name!r} (segment_id={segment_id})."
             )
 
+        target_override = {
+            "segment": {"id": segment_id},
+            "enabled": False,
+            "priority": existing.get("priority", 0),
+            "value": existing.get("value"),
+        }
+        merged_overrides = self._merge_segment_overrides(
+            current.get("segment_overrides", []),
+            segment_id,
+            target_override,
+        )
         updated = self._patch_future_feature_state(
             env_api_key,
             feature_id,
-            {
-                "segment_overrides": [
-                    {
-                        "segment": {"id": segment_id},
-                        "enabled": False,
-                        "priority": existing.get("priority", 0),
-                        "value": existing.get("value"),
-                    }
-                ]
-            },
+            {"segment_overrides": merged_overrides},
         )
         result = self._find_segment_override(updated, segment_id)
         if result is None:

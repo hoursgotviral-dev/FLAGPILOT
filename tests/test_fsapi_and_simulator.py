@@ -506,3 +506,98 @@ def test_notify_health_builds_alertmanager_payload_and_is_failsafe(
         )
     assert "unreachable" in caplog.text
     assert "hook-secret-123" not in caplog.text
+
+
+def test_fsapi_preserves_other_segment_overrides_and_follows_pagination() -> None:
+    """attach/disable preserve unrelated segment overrides; feature/segment lookups follow pagination."""
+    session = MagicMock()
+    session.headers = {}
+    client = FlagsmithManagementClient(
+        FlagsmithConfig(
+            api_url="http://localhost:8000",
+            admin_key="tok",
+            environment_key="env-key-1",
+            project_id=42,
+        ),
+        session=session,
+    )
+
+    other_override = {"segment": {"id": 999}, "priority": 5, "enabled": True, "value": "beta"}
+
+    # 1. Paginated feature lookup + attach preserving other_override
+    session.request.side_effect = [
+        _mock_response([{"id": 7, "name": "prod", "api_key": "env-key-1"}]),  # resolve_env
+        _mock_response(
+            {
+                "results": [{"id": 1, "name": "other_flag"}],
+                "next": "http://localhost:8000/api/v1/projects/42/features/?page=2",
+            }
+        ),  # GET features page 1
+        _mock_response({"results": [{"id": 99, "name": "checkout_v2"}], "next": None}),  # page 2
+        _mock_response(
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [other_override],
+            }
+        ),  # GET __future__ state
+        _mock_response(
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    other_override,
+                    {"segment": {"id": 500}, "priority": 0, "enabled": True, "value": None},
+                ],
+            }
+        ),  # PATCH __future__ state
+    ]
+    client.attach_segment_override("checkout_v2", 500, enabled=True)
+    patch_body = session.request.call_args_list[-1].kwargs["json"]["segment_overrides"]
+    assert [o["segment"]["id"] for o in patch_body] == [999, 500]
+    assert patch_body[0]["enabled"] is True
+    assert patch_body[0]["value"] == "beta"
+    assert patch_body[1]["enabled"] is True
+
+    # 2. disable_override preserves other_override while disabling FlagPilot segment 500
+    session.request.side_effect = [
+        _mock_response([{"id": 7, "name": "prod", "api_key": "env-key-1"}]),
+        _mock_response([{"id": 99, "name": "checkout_v2"}]),
+        _mock_response(
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    other_override,
+                    {"segment": {"id": 500}, "priority": 0, "enabled": True, "value": None},
+                ],
+            }
+        ),
+        _mock_response(
+            {
+                "environment_default": {"enabled": False, "value": None},
+                "segment_overrides": [
+                    other_override,
+                    {"segment": {"id": 500}, "priority": 0, "enabled": False, "value": None},
+                ],
+            }
+        ),
+    ]
+    client.disable_override("checkout_v2", segment_id=500)
+    disable_body = session.request.call_args_list[-1].kwargs["json"]["segment_overrides"]
+    assert disable_body[0] == {"segment": {"id": 999}, "enabled": True, "priority": 5, "value": "beta"}
+    assert disable_body[1] == {"segment": {"id": 500}, "enabled": False, "priority": 0, "value": None}
+
+    # 3. create_segment_with_percentage_split follows pagination to find existing segment on page 2
+    session.request.side_effect = [
+        _mock_response(
+            {
+                "results": [{"id": 100, "name": "unrelated"}],
+                "next": "/api/v1/projects/42/segments/?page=2",
+            }
+        ),
+        _mock_response(
+            {"results": [{"id": 500, "name": "flagpilot-checkout_v2-rollout"}], "next": None}
+        ),
+        _mock_response({"id": 500, "name": "flagpilot-checkout_v2-rollout"}),
+    ]
+    seg = client.create_segment_with_percentage_split("flagpilot-checkout_v2-rollout", 25)
+    assert seg["id"] == 500
+    assert session.request.call_args_list[-1].kwargs["method"] == "PUT"

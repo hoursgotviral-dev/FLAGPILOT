@@ -70,22 +70,32 @@ def _format_stage_summary(plan: Plan, percentage: int, *, action: str) -> str:
 def _format_run_policy_summary(plan: Plan, *, rollback_to_zero: bool = False) -> str:
     segment_name = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
     schedule = " -> ".join(f"{step.percentage}%" for step in plan.steps)
-    min_samples = plan.steps[0].min_samples if plan.steps else 20
-    max_error_rate = plan.steps[0].max_error_rate if plan.steps else 0.02
-    rollback_policy = (
-        f"{plan.rollback_percentage}% (direct zero-exposure rollback)"
-        if rollback_to_zero
-        else "previous safe stage (or 0% on initial stage)"
-    )
+    rates = {step.max_error_rate for step in plan.steps}
+    samples = {step.min_samples for step in plan.steps}
+    if not plan.steps or (len(rates) == 1 and len(samples) == 1):
+        min_samples = plan.steps[0].min_samples if plan.steps else 20
+        max_error_rate = plan.steps[0].max_error_rate if plan.steps else 0.02
+        threshold_desc = f"min_samples={min_samples}, max_error_rate={max_error_rate:.2%}"
+    else:
+        threshold_desc = "per-step limits: " + ", ".join(
+            f"{step.percentage}%<= {step.max_error_rate:.2%} (min={step.min_samples})"
+            for step in plan.steps
+        )
+
+    if plan.on_breach == "pause" and not rollback_to_zero:
+        breach_action_desc = "pause at failing stage (no auto-rollback)"
+    elif rollback_to_zero:
+        breach_action_desc = f"auto-rollback to {plan.rollback_percentage}% (direct zero-exposure rollback)"
+    else:
+        breach_action_desc = "auto-rollback to previous safe stage (or 0% on initial stage)"
     return (
         "Action: authorize_rollout_run\n"
         f"Feature: {plan.feature_name}\n"
         f"Environment: {plan.environment}\n"
         f"Segment: {segment_name}\n"
         f"Rollout schedule: {schedule}\n"
-        f"Safety policy: min_samples={min_samples}, max_error_rate={max_error_rate:.2%} -> "
-        f"auto-rollback to {rollback_policy}\n"
-        "Execution mode: stages and emergency rollback run automatically after this approval."
+        f"Safety policy: {threshold_desc} -> {breach_action_desc}\n"
+        "Execution mode: stages and breach policy run automatically after this approval."
     )
 
 
@@ -211,7 +221,8 @@ class ApprovedFlagsmithWriter:
         use_run_approval: bool = False,
     ) -> RolloutChange:
         """Gate and apply a rollout stage percentage to Flagsmith."""
-        if not (use_run_approval and self._is_run_authorized(plan)):
+        run_authorized = use_run_approval and self._is_run_authorized(plan)
+        if not run_authorized:
             summary = _format_stage_summary(plan, percentage, action="apply_stage")
             require_approval(
                 summary,
@@ -220,7 +231,8 @@ class ApprovedFlagsmithWriter:
                 is_tty=self._is_tty,
             )
         change = self._write_percentage(plan, percentage)
-        self._record_audit("apply_stage", change)
+        if not run_authorized:
+            self._record_audit("apply_stage", change)
         return change
 
     def apply_plan(self, plan: Plan, *, percentage: int | None = None) -> RolloutChange:
@@ -243,7 +255,8 @@ class ApprovedFlagsmithWriter:
         resolved_target = (
             plan.rollback_percentage if target_percentage is None else target_percentage
         )
-        if not (use_run_approval and self._is_run_authorized(plan)):
+        run_authorized = use_run_approval and self._is_run_authorized(plan)
+        if not run_authorized:
             summary = _format_stage_summary(plan, resolved_target, action="rollback")
             if reason:
                 summary = f"{summary}\nReason: {reason}"
@@ -254,5 +267,6 @@ class ApprovedFlagsmithWriter:
                 is_tty=self._is_tty,
             )
         change = self._write_percentage(plan, resolved_target)
-        self._record_audit("rollback", change, reason=reason)
+        if not run_authorized:
+            self._record_audit("rollback", change, reason=reason)
         return change

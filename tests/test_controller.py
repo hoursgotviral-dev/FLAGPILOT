@@ -19,6 +19,7 @@ from flagpilot.controller import (
     HttpSignalProvider,
     RolloutController,
     SignalCollectionError,
+    evaluate_stage,
     execute_manual_rollback,
 )
 from flagpilot.planner import build_plan
@@ -670,6 +671,8 @@ def test_http_signal_provider_and_fail_closed_credential_sanitization(
     assert res.final_status == "rolled_back"
     assert res.rollback_applied is True
     assert res.rollback_to_percentage == 0
+    assert res.outcomes[0].metrics.signal_error is not None
+    assert res.outcomes[0].decision.observed_error_rate is None
     assert client.percentage_history == [1, 0]
     audit_text = audit_log.read_text(encoding="utf-8")
     assert "fail-closed" in audit_text
@@ -742,3 +745,91 @@ def test_file_signal_provider_direct_breach_at_1pct_and_fail_closed(tmp_path: Pa
     f_bad.write_text("-0.05", encoding="utf-8")
     with pytest.raises(SignalCollectionError):
         FileSignalProvider(f_bad).collect(plan, plan.steps[0])
+
+
+def test_controller_honors_on_breach_pause_unless_rollback_to_zero(tmp_path: Path) -> None:
+    """plan.on_breach='pause' pauses without rollback unless rollback_to_zero=True overrides."""
+    plan = build_plan(
+        "checkout_v2",
+        "Development",
+        stages=(1, 10, 50),
+        max_error_rate=0.02,
+        on_breach="pause",
+    )
+
+    decision_pause = evaluate_stage(
+        plan.steps[1],
+        sample_count=200,
+        error_count=20,
+        next_step=plan.steps[2],
+        on_breach="pause",
+    )
+    assert decision_pause.action == "pause"
+    assert decision_pause.next_percentage == 10
+
+    evaluator = OfflineFakeEvaluator()
+    sim = TrafficSimulator(
+        evaluator,
+        user_count=200,
+        seed=42,
+        baseline_rate=0.005,
+        error_rate_fn=make_error_rate_fn(
+            baseline_rate=0.005,
+            spike_rate=0.25,
+            spike_threshold_pct=25.0,
+        ),
+    )
+
+    # 1. Default rollback_to_zero=False -> pauses at 50% without rolling back
+    client_pause = _FakeFlagsmithClient()
+    audit_pause = tmp_path / "audit_pause.log"
+    out_pause = io.StringIO()
+    res_pause = RolloutController(
+        ApprovedFlagsmithWriter(
+            client_pause,
+            input_stream=io.StringIO("APPROVE\n"),
+            output_stream=io.StringIO(),
+            is_tty=True,
+        ),
+        _SimulatorSignalProvider(evaluator, sim),
+        audit_log_path=audit_pause,
+        output_stream=out_pause,
+        rollback_to_zero=False,
+    ).run(plan)
+    assert res_pause.final_status == "paused"
+    assert res_pause.rollback_applied is False
+    assert client_pause.percentage_history == [1, 10, 50]
+    assert "Paused at 50%" in out_pause.getvalue()
+    pause_rows = [json.loads(line) for line in audit_pause.read_text(encoding="utf-8").splitlines()]
+    assert pause_rows[-1]["action"] == "pause"
+    assert pause_rows[-1]["new_percentage"] == 50
+
+    # 2. Explicit rollback_to_zero=True overrides on_breach='pause' and rolls back to 0%
+    client_rb = _FakeFlagsmithClient()
+    eval_rb = OfflineFakeEvaluator()
+    sim_rb = TrafficSimulator(
+        eval_rb,
+        user_count=200,
+        seed=42,
+        baseline_rate=0.005,
+        error_rate_fn=make_error_rate_fn(
+            baseline_rate=0.005,
+            spike_rate=0.25,
+            spike_threshold_pct=25.0,
+        ),
+    )
+    res_rb = RolloutController(
+        ApprovedFlagsmithWriter(
+            client_rb,
+            input_stream=io.StringIO("APPROVE\n"),
+            output_stream=io.StringIO(),
+            is_tty=True,
+        ),
+        _SimulatorSignalProvider(eval_rb, sim_rb),
+        audit_log_path=tmp_path / "audit_rb.log",
+        output_stream=io.StringIO(),
+        rollback_to_zero=True,
+    ).run(plan)
+    assert res_rb.final_status == "rolled_back"
+    assert res_rb.rollback_applied is True
+    assert client_rb.percentage_history == [1, 10, 50, 0]

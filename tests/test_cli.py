@@ -232,6 +232,12 @@ def test_cli_bootstrap_subcommand(tmp_path: Path) -> None:
         err_code = main(["bootstrap", "--env-file", str(env_file)])
     assert err_code == 1
 
+    with patch("flagpilot.cli.wait_for_liveness") as mock_wait:
+        wait_code = main(["bootstrap", "--wait-only", "--base-url", "http://localhost:8000"])
+    assert wait_code == 0
+    mock_wait.assert_called_once()
+    assert mock_wait.call_args.kwargs["timeout_seconds"] == 300.0
+
 
 def test_cli_missing_file_returns_clean_error(
     tmp_path: Path,
@@ -299,6 +305,13 @@ def test_cli_run_upfront_approve_and_step_approve_flag(
     html_doc = html_out.read_text(encoding="utf-8")
     assert "0/200 exposed identities after rollback to 0%" in html_doc
     assert "stayed enrolled" in html_doc
+    assert "approve_run" in html_doc
+
+    audit1_entries = [
+        json.loads(line) for line in (tmp_path / "audit1.log").read_text(encoding="utf-8").splitlines()
+    ]
+    assert audit1_entries[0]["action"] == "approve_run"
+    assert [e["action"] for e in audit1_entries].count("rollback") == 1
 
     # Opt-in --step-approve with only 1 APPROVE pauses at stage 2
     client2 = _FakeBackend()
@@ -611,6 +624,14 @@ def test_cli_run_signal_file_and_signal_url_modes(
     assert backend2.calls == [("apply", 1), ("rollback", 0)]
     audit2_text = audit2.read_text(encoding="utf-8")
     assert "fail-closed" in audit2_text
+    assert "approve_run" in audit2_text
     assert "top-secret-token" not in audit2_text
     assert "k123" not in audit2_text
+    run_url_data = json.loads((tmp_path / "run_url.json").read_text(encoding="utf-8"))
+    assert run_url_data["outcomes"][0]["metrics"]["sample_count"] == 200
+    assert run_url_data["outcomes"][0]["metrics"]["signal_error"] is not None
+    assert run_url_data["outcomes"][0]["decision"]["observed_error_rate"] is None
+    html_url_doc = (tmp_path / "rollout_url.html").read_text(encoding="utf-8")
+    assert "N/A (signal error)" in html_url_doc
+    assert "/ 200" in html_url_doc
     capsys.readouterr()

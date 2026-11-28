@@ -17,6 +17,7 @@ import requests
 
 from flagpilot.apply import ApprovalDeniedError, ApprovedFlagsmithWriter
 from flagpilot.types import (
+    BreachAction,
     Decision,
     HealthNotifier,
     MonotonicityCheck,
@@ -36,6 +37,15 @@ OBSERVED_LABEL = "OBSERVED"
 
 class SignalCollectionError(RuntimeError):
     """Raised when an external error-rate signal provider fails (fail-closed rollback)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_metrics: StageMetrics | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.partial_metrics = partial_metrics
 
 
 class StageSignalProvider(Protocol):
@@ -307,8 +317,9 @@ def evaluate_stage(
     observed_error_rate: float | None = None,
     rollback_target: int = 0,
     enforce_min_samples: bool = True,
+    on_breach: BreachAction = "rollback",
 ) -> Decision:
-    """Decide whether to hold, rollback, advance, or complete a rollout stage."""
+    """Decide whether to hold, pause, rollback, advance, or complete a rollout stage."""
     if sample_count < 0 or error_count < 0 or error_count > sample_count:
         raise ValueError(
             f"Invalid sample/error counts: sample_count={sample_count}, error_count={error_count}."
@@ -330,6 +341,18 @@ def evaluate_stage(
         )
 
     if rate > step.max_error_rate:
+        if on_breach == "pause":
+            return Decision(
+                action="pause",
+                reason=(
+                    f"Error rate {rate:.2%} exceeded threshold "
+                    f"{step.max_error_rate:.2%}; pausing rollout at {step.percentage}%."
+                ),
+                current_percentage=step.percentage,
+                next_percentage=step.percentage,
+                observed_error_rate=rate,
+                sample_count=sample_count,
+            )
         return Decision(
             action="rollback",
             reason=(
@@ -526,9 +549,12 @@ class RolloutController:
                 )
 
             threshold = outcome.step.max_error_rate
-            cmp_op = ">" if m.error_rate > threshold else "<="
-            rate_style = "bold red" if d.action == "rollback" else "green"
-            rate_cell = f"[{rate_style}]{m.error_rate:.2%} {cmp_op} {threshold:.2%}[/{rate_style}]"
+            if m.signal_error is not None:
+                rate_cell = "[bold red]N/A (signal error)[/bold red]"
+            else:
+                cmp_op = ">" if m.error_rate > threshold else "<="
+                rate_style = "bold red" if d.action in ("rollback", "pause", "hold") else "green"
+                rate_cell = f"[{rate_style}]{m.error_rate:.2%} {cmp_op} {threshold:.2%}[/{rate_style}]"
 
             if d.action == "rollback":
                 badge = "[bold white on red] ROLLBACK [/bold white on red]"
@@ -539,9 +565,14 @@ class RolloutController:
             else:
                 badge = "[bold white on green] PASS [/bold white on green]"
 
+            exposed_cell = (
+                "[dim]N/A (signal error)[/dim]"
+                if m.sample_count == 0 and m.signal_error is not None
+                else f"{m.enabled_count}/{m.sample_count}"
+            )
             table.add_row(
                 f"{outcome.step.percentage}%",
-                f"{m.enabled_count}/{m.sample_count}",
+                exposed_cell,
                 retention_cell,
                 rate_cell,
                 badge,
@@ -738,15 +769,32 @@ class RolloutController:
                 try:
                     metrics = self._signal_provider.collect(plan, step)
                 except SignalCollectionError as exc:
+                    partial = exc.partial_metrics
                     metrics = StageMetrics(
                         percentage=step.percentage,
-                        sample_count=0,
+                        sample_count=partial.sample_count if partial is not None else 0,
                         error_count=0,
-                        enabled_count=0,
+                        enabled_count=partial.enabled_count if partial is not None else 0,
                         source_label=OBSERVED_LABEL,
-                        reported_error_rate=1.0,
+                        reported_error_rate=None,
+                        exposed_identities=(
+                            partial.exposed_identities if partial is not None else None
+                        ),
+                        signal_error=str(exc),
                     )
-                    monotonic_check = None
+                    monotonic_check = _compute_monotonicity_check(
+                        prev_stage_pct,
+                        prev_exposed_ids,
+                        step.percentage,
+                        metrics.exposed_identities,
+                    )
+                    if monotonic_check is not None and not use_live_table:
+                        self._output_stream.write(
+                            f"Monotonicity check: {monotonic_check.summary}\n"
+                        )
+                    prev_stage_pct = step.percentage
+                    if metrics.exposed_identities is not None:
+                        prev_exposed_ids = frozenset(metrics.exposed_identities)
                     decision = Decision(
                         action="rollback",
                         reason=(
@@ -755,8 +803,8 @@ class RolloutController:
                         ),
                         current_percentage=step.percentage,
                         next_percentage=rollback_target,
-                        observed_error_rate=1.0,
-                        sample_count=0,
+                        observed_error_rate=None,
+                        sample_count=metrics.sample_count,
                     )
                 else:
                     monotonic_check = _compute_monotonicity_check(
@@ -773,6 +821,9 @@ class RolloutController:
                     if metrics.exposed_identities is not None:
                         prev_exposed_ids = frozenset(metrics.exposed_identities)
 
+                    effective_on_breach: BreachAction = (
+                        "rollback" if self._rollback_to_zero else plan.on_breach
+                    )
                     decision = evaluate_stage(
                         step=step,
                         sample_count=metrics.sample_count,
@@ -781,6 +832,7 @@ class RolloutController:
                         observed_error_rate=metrics.error_rate,
                         rollback_target=rollback_target,
                         enforce_min_samples=(metrics.source_label != OBSERVED_LABEL),
+                        on_breach=effective_on_breach,
                     )
                 outcomes.append(
                     StageOutcome(
@@ -806,8 +858,8 @@ class RolloutController:
                     ),
                     reason=decision.reason,
                     observed_error_rate=decision.observed_error_rate,
-                    exposed_count=metrics.enabled_count,
-                    sample_count=metrics.sample_count,
+                    exposed_count=(metrics.enabled_count if metrics.sample_count > 0 else None),
+                    sample_count=(metrics.sample_count if metrics.sample_count > 0 else None),
                     retained_from_previous_stage=(
                         monotonicity_check_to_dict(monotonic_check)
                         if monotonic_check is not None

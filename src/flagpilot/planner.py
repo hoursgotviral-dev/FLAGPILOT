@@ -475,21 +475,37 @@ def plan_risks(plan: Plan) -> list[str]:
     ]
 
 
+def _format_step_thresholds(plan: Plan) -> tuple[str, str]:
+    """Return concise threshold summary (handles uniform or per-step differing thresholds)."""
+    if not plan.steps:
+        return "0.00%", "min_samples=20"
+    rates = {s.max_error_rate for s in plan.steps}
+    samples = {s.min_samples for s in plan.steps}
+    if len(rates) == 1 and len(samples) == 1:
+        step = plan.steps[0]
+        return f"{step.max_error_rate:.2%}", f"min_samples={step.min_samples}"
+    rate_parts = ", ".join(f"{s.percentage}%: {s.max_error_rate:.2%}" for s in plan.steps)
+    sample_parts = ", ".join(f"{s.percentage}%: {s.min_samples}" for s in plan.steps)
+    return f"per-step ({rate_parts})", f"min_samples per-step ({sample_parts})"
+
+
 def threshold_breach_behavior(plan: Plan) -> str:
     """Describe what happens if the configured error-rate threshold is breached."""
-    step = plan.steps[0]
+    threshold_text, samples_text = _format_step_thresholds(plan)
     if plan.on_breach == "pause":
         return (
-            f"If observed error rate exceeds {step.max_error_rate:.2%} "
-            f"(after at least {step.min_samples} samples), FlagPilot pauses the rollout, "
-            "records the decision with UTC timestamp and reason to audit.log, "
-            "and waits for operator review or an approved rollback."
+            f"If observed error rate exceeds {threshold_text} "
+            f"({samples_text}), FlagPilot pauses the rollout unless "
+            "--rollback-to-zero is passed, records the decision with UTC timestamp "
+            "and reason to audit.log, and waits for operator review or an approved rollback."
         )
     return (
-        f"If observed error rate exceeds {step.max_error_rate:.2%} "
-        f"(after at least {step.min_samples} samples), FlagPilot halts advancement, "
-        f"requests interactive APPROVE to roll back to the previous safe percentage "
-        f"(or {plan.rollback_percentage}%), and logs the decision to audit.log."
+        f"If observed error rate exceeds {threshold_text} "
+        f"({samples_text}), FlagPilot halts advancement and is configured to roll back "
+        f"automatically to the previous safe percentage (or {plan.rollback_percentage}% with "
+        "--rollback-to-zero or on the initial stage) under the upfront schedule APPROVE "
+        "(or prompts for interactive APPROVE per action with --step-approve), "
+        "logging the decision to audit.log."
     )
 
 
@@ -524,11 +540,12 @@ def render_plan_markdown(plan: Plan) -> str:
     for risk in plan_risks(plan):
         lines.append(f"- {risk}")
 
+    threshold_text, samples_text = _format_step_thresholds(plan)
     lines.extend(
         [
             "",
             "## If Threshold Is Breached",
-            f"- **Threshold**: `{plan.steps[0].max_error_rate:.2%}` (min samples: `{plan.steps[0].min_samples}`)",
+            f"- **Threshold**: `{threshold_text}` (`{samples_text}`)",
             f"- **Configured Breach Action**: `{plan.on_breach}`",
             f"- {threshold_breach_behavior(plan)}",
         ]
@@ -667,8 +684,7 @@ def _supports_unicode(stream: TextIO) -> bool:
 def format_plan_summary_plain(plan: Plan) -> str:
     """Format a deterministic plain-text summary of a rollout plan."""
     progression = "0% -> " + " -> ".join(f"{step.percentage}%" for step in plan.steps)
-    threshold = plan.steps[0].max_error_rate
-    min_samples = plan.steps[0].min_samples
+    threshold_text, samples_text = _format_step_thresholds(plan)
     segment = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
     calls = planned_api_calls(plan)
     lines = [
@@ -676,7 +692,7 @@ def format_plan_summary_plain(plan: Plan) -> str:
         f"Environment: {plan.environment}",
         f"Segment: {segment} (PERCENTAGE_SPLIT)",
         f"Stage Progression: {progression}",
-        f"Safety Threshold: max_error_rate <= {threshold:.2%} (min_samples={min_samples}, on_breach={plan.on_breach} -> {plan.rollback_percentage}%)",
+        f"Safety Threshold: max_error_rate <= {threshold_text} ({samples_text}, on_breach={plan.on_breach} -> {plan.rollback_percentage}%)",
         "Planned Flagsmith API Calls:",
     ]
     for idx, call in enumerate(calls, start=1):
@@ -709,8 +725,7 @@ def render_plan_summary(
 
     arrow = "→" if _supports_unicode(out) else "->"
     progression = f"0% {arrow} " + f" {arrow} ".join(f"{step.percentage}%" for step in plan.steps)
-    threshold = plan.steps[0].max_error_rate
-    min_samples = plan.steps[0].min_samples
+    threshold_text, samples_text = _format_step_thresholds(plan)
     segment = plan.segment_name or f"flagpilot-{plan.feature_name}-rollout"
     is_tty = bool(getattr(out, "isatty", lambda: False)())
 
@@ -723,7 +738,7 @@ def render_plan_summary(
     meta_table.add_row("Stage Progression", progression)
     meta_table.add_row(
         "Safety Threshold",
-        f"error_rate <= {threshold:.2%} (min_samples={min_samples}, on_breach={plan.on_breach} {arrow} {plan.rollback_percentage}%)",
+        f"error_rate <= {threshold_text} ({samples_text}, on_breach={plan.on_breach} {arrow} {plan.rollback_percentage}%)",
     )
 
     calls = planned_api_calls(plan)
